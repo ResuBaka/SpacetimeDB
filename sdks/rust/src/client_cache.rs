@@ -3,22 +3,35 @@
 //! This module is internal, and may incompatibly change without warning.
 
 use crate::callbacks::CallbackId;
-use crate::db_connection::{debug_log, PendingMutation, SharedCell};
+#[cfg(feature = "client-cache")]
+use crate::db_connection::debug_log;
+use crate::db_connection::{PendingMutation, SharedCell};
 use crate::spacetime_module::{InModule, SpacetimeModule, TableUpdate, WithBsatn};
+#[cfg(feature = "client-cache")]
 use anymap3::Map;
+#[cfg(any(feature = "client-cache", test))]
 use bytes::Bytes;
+#[cfg(feature = "client-cache")]
 use core::any::type_name;
 use core::hash::Hash;
 use futures_channel::mpsc;
-use spacetimedb_data_structures::map::{hash_map::Entry, HashCollectionExt, HashMap};
+#[cfg(feature = "client-cache")]
+use spacetimedb_data_structures::map::hash_map::Entry;
+use spacetimedb_data_structures::map::HashMap;
+#[cfg(feature = "client-cache")]
+use spacetimedb_data_structures::map::HashSet;
+use spacetimedb_lib::ser::Serialize;
+#[cfg(feature = "client-cache")]
 use std::any::Any;
 use std::fmt::Debug;
 use std::fs::File;
+#[cfg(feature = "client-cache")]
 use std::io::Write;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// A local mirror of the subscribed rows of one table in the database.
+#[cfg(feature = "client-cache")]
 pub struct TableCache<Row> {
     /// A map of row-bytes to rows.
     ///
@@ -29,7 +42,7 @@ pub struct TableCache<Row> {
     /// are more efficient than for domain types,
     /// as they can be implemented directly via SIMD without skipping padding
     /// or branching on enum variants.
-    pub(crate) entries: HashMap<Bytes, RowEntry<Row>>,
+    entries: TableEntries<Row>,
 
     /// Each of the unique indices on this table.
     ///
@@ -44,7 +57,54 @@ pub struct TableCache<Row> {
     extra_logging: Option<SharedCell<File>>,
 }
 
+#[cfg(feature = "client-cache")]
+enum TableEntries<Row> {
+    RefCounted(HashMap<Bytes, RowEntry<Row>>),
+    Uncounted(HashMap<Bytes, Row>),
+}
+
+#[cfg(feature = "client-cache")]
+impl<Row> Default for TableEntries<Row> {
+    fn default() -> Self {
+        Self::RefCounted(HashMap::default())
+    }
+}
+
+#[cfg(feature = "client-cache")]
+impl<Row> TableEntries<Row> {
+    fn len(&self) -> usize {
+        match self {
+            Self::RefCounted(entries) => entries.len(),
+            Self::Uncounted(entries) => entries.len(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn use_ref_counts(&mut self, enabled: bool) {
+        if enabled && matches!(self, Self::Uncounted(_)) {
+            let Self::Uncounted(entries) = std::mem::take(self) else {
+                unreachable!()
+            };
+            *self = Self::RefCounted(
+                entries
+                    .into_iter()
+                    .map(|(bsatn, row)| (bsatn, RowEntry { row, ref_count: 1 }))
+                    .collect(),
+            );
+        } else if !enabled && matches!(self, Self::RefCounted(_)) {
+            let Self::RefCounted(entries) = std::mem::take(self) else {
+                unreachable!()
+            };
+            *self = Self::Uncounted(entries.into_iter().map(|(bsatn, entry)| (bsatn, entry.row)).collect());
+        }
+    }
+}
+
 /// Stores an entry of the typed row value together with its ref count in the table cache.
+#[cfg(feature = "client-cache")]
 pub(crate) struct RowEntry<Row> {
     /// The typed row value, interpreted from raw BSATN bytes.
     row: Row,
@@ -66,6 +126,7 @@ pub(crate) struct RowEntry<Row> {
 }
 
 // Can't derive this because the `Row` generic messes us up.
+#[cfg(feature = "client-cache")]
 impl<Row> TableCache<Row> {
     fn new(extra_logging: Option<SharedCell<File>>) -> Self {
         Self {
@@ -76,7 +137,14 @@ impl<Row> TableCache<Row> {
     }
 }
 
-type RowEventMap<'r, Row> = HashMap<&'r [u8], &'r Row>;
+#[cfg(feature = "client-cache")]
+impl<Row> Default for TableCache<Row> {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+type RowEventList<'r, Row> = Vec<(&'r [u8], &'r Row)>;
 
 /// The diff result of applying [`TableUpdate`] to a [`TableCache`].
 ///
@@ -89,16 +157,17 @@ type RowEventMap<'r, Row> = HashMap<&'r [u8], &'r Row>;
 /// and the set `inserts` with `update_inserts`.
 /// When the latter sets are populated, they are *moved* from the former.
 pub struct TableAppliedDiff<'r, Row> {
-    /// The unique set of semantic deletes ("evictions") from the client cache.
-    deletes: RowEventMap<'r, Row>,
-    /// The unique set of semantic inserts from the client cache.
-    inserts: RowEventMap<'r, Row>,
+    /// The semantic deletes, or raw deletes when row deduplication is disabled.
+    deletes: RowEventList<'r, Row>,
+    /// The semantic inserts, or raw inserts when row deduplication is disabled.
+    inserts: RowEventList<'r, Row>,
     /// The delete part of the unique set of semantic updates from the client cache.
     /// For every element in this list there is a corresponding one in `update_inserts`.
     update_deletes: Vec<&'r Row>,
     /// The insert part of the unique set of semantic updates from the client cache.
     /// For every element in this list there is a corresponding one in `update_deletes`.
     update_inserts: Vec<&'r Row>,
+    initial_rows: Option<&'r [WithBsatn<Row>]>,
 }
 
 impl<Row> Default for TableAppliedDiff<'_, Row> {
@@ -108,6 +177,7 @@ impl<Row> Default for TableAppliedDiff<'_, Row> {
             inserts: <_>::default(),
             update_deletes: <_>::default(),
             update_inserts: <_>::default(),
+            initial_rows: None,
         }
     }
 }
@@ -123,9 +193,19 @@ impl<'r, Row> TableAppliedDiff<'r, Row> {
             deletes: Default::default(),
             update_deletes: Vec::new(),
             update_inserts: Vec::new(),
+            initial_rows: None,
         }
     }
 
+    fn from_raw(diff: &'r TableUpdate<Row>) -> Self {
+        Self {
+            deletes: diff.deletes.iter().map(|row| (row.bsatn.as_ref(), &row.row)).collect(),
+            inserts: diff.inserts.iter().map(|row| (row.bsatn.as_ref(), &row.row)).collect(),
+            update_deletes: Vec::new(),
+            update_inserts: Vec::new(),
+            initial_rows: diff.is_initial().then_some(&diff.inserts),
+        }
+    }
     /// Returns the applied diff restructured
     /// with row updates where deletes and inserts are found according to `derive_pk`.
     pub fn with_updates_by_pk<Pk: Eq + Hash>(mut self, derive_pk: impl Fn(&Row) -> &Pk) -> Self {
@@ -140,29 +220,41 @@ impl<'r, Row> TableAppliedDiff<'r, Row> {
             return;
         }
 
-        // Compute the PK -> Row map for deletes.
-        let mut delete_pks = HashMap::with_capacity(self.deletes.len());
-        for (&bsatn, &row) in self.deletes.iter() {
-            let pk = derive_pk(row);
-            delete_pks.insert(pk, (bsatn, row));
+        let mut deletes_by_pk: HashMap<&Pk, usize> = HashMap::default();
+        deletes_by_pk.reserve(self.deletes.len());
+        let mut next_delete_by_pk = vec![None; self.deletes.len()];
+        for delete_index in (0..self.deletes.len()).rev() {
+            let delete_row = self.deletes[delete_index].1;
+            next_delete_by_pk[delete_index] = deletes_by_pk.insert(derive_pk(delete_row), delete_index);
         }
 
-        // Compute the PK -> Row for inserts,
-        // removing from inserts and deletes if there is a match in deletions.
-        self.update_inserts = self
-            .inserts
-            .extract_if(|_, ins_row| {
-                let pk = derive_pk(ins_row);
-                let Some((del_bsatn, del_row)) = delete_pks.get(pk) else {
-                    return false;
-                };
-                self.update_deletes.push(del_row);
-                let _deleted = self.deletes.remove(del_bsatn);
-                debug_assert!(_deleted.is_some());
-                true
-            })
-            .map(|(_, ins_row)| ins_row)
-            .collect::<Vec<_>>();
+        let mut matched_deletes = vec![false; self.deletes.len()];
+        let update_capacity = self.inserts.len().min(self.deletes.len());
+        self.update_deletes.reserve(update_capacity);
+        self.update_inserts.reserve(update_capacity);
+        self.inserts.retain(|(_, insert_row)| {
+            let insert_pk = derive_pk(insert_row);
+            let Some(delete_index) = deletes_by_pk.get(insert_pk).copied() else {
+                return true;
+            };
+            if let Some(next_delete) = next_delete_by_pk[delete_index] {
+                *deletes_by_pk.get_mut(insert_pk).unwrap() = next_delete;
+            } else {
+                deletes_by_pk.remove(insert_pk);
+            }
+
+            matched_deletes[delete_index] = true;
+            self.update_deletes.push(self.deletes[delete_index].1);
+            self.update_inserts.push(insert_row);
+            false
+        });
+
+        let mut delete_index = 0;
+        self.deletes.retain(|_| {
+            let keep = !matched_deletes[delete_index];
+            delete_index += 1;
+            keep
+        });
     }
 
     /// Returns whether the applied diff is empty.
@@ -175,12 +267,12 @@ impl<'r, Row> TableAppliedDiff<'r, Row> {
 
     /// Returns the deleted rows in this diff.
     pub(super) fn deletes(&self) -> impl '_ + Iterator<Item = &'r Row> {
-        self.deletes.values().copied()
+        self.deletes.iter().map(|(_, row)| *row)
     }
 
     /// Returns the inserted rows in this diff.
     pub(super) fn inserts(&self) -> impl '_ + Iterator<Item = &'r Row> {
-        self.inserts.values().copied()
+        self.inserts.iter().map(|(_, row)| *row)
     }
 
     /// Returns the updated rows in this diff.
@@ -191,28 +283,272 @@ impl<'r, Row> TableAppliedDiff<'r, Row> {
             .copied()
             .zip(self.update_inserts.iter().copied())
     }
-}
 
-impl<Row> TableCache<Row> {
-    fn debug_log(&self, body: impl FnOnce(&mut File) -> std::result::Result<(), std::io::Error>) {
-        debug_log(&self.extra_logging, body);
+    pub(super) fn initial_rows(&self) -> Option<&'r [WithBsatn<Row>]> {
+        self.initial_rows
     }
 }
 
+#[cfg(test)]
+mod applied_diff_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[derive(Debug, PartialEq)]
+    struct PkRow {
+        id: u32,
+        value: u32,
+    }
+
+    fn row(id: u32, value: u32) -> WithBsatn<PkRow> {
+        WithBsatn {
+            bsatn: Bytes::new(),
+            row: PkRow { id, value },
+        }
+    }
+
+    #[test]
+    fn derives_updates_with_duplicate_and_unmatched_primary_keys() {
+        let mut update = TableUpdate::default();
+        update.deletes = vec![row(1, 10), row(1, 11), row(2, 20)];
+        update.inserts = vec![row(1, 12), row(3, 30)];
+
+        let applied = TableAppliedDiff::from_raw(&update).with_updates_by_pk(|row| &row.id);
+
+        assert_eq!(
+            applied.updates().collect::<Vec<_>>(),
+            vec![(&update.deletes[0].row, &update.inserts[0].row)]
+        );
+        assert_eq!(
+            applied.deletes().collect::<Vec<_>>(),
+            vec![&update.deletes[1].row, &update.deletes[2].row]
+        );
+        assert_eq!(applied.inserts().collect::<Vec<_>>(), vec![&update.inserts[1].row]);
+    }
+
+    #[test]
+    fn derives_large_update_batch_with_linear_key_projections() {
+        const ROW_COUNT: u32 = 256;
+
+        let mut update = TableUpdate::default();
+        update.deletes = (0..ROW_COUNT).map(|id| row(id, id)).collect();
+        update.inserts = (0..ROW_COUNT).rev().map(|id| row(id, id + 1)).collect();
+
+        let projection_count = Cell::new(0);
+        let applied = TableAppliedDiff::from_raw(&update).with_updates_by_pk(|row| {
+            projection_count.set(projection_count.get() + 1);
+            &row.id
+        });
+
+        assert_eq!(applied.updates().count(), ROW_COUNT as usize);
+        assert_eq!(projection_count.get(), ROW_COUNT as usize * 2);
+    }
+}
+
+#[cfg(any(feature = "client-cache", test))]
+#[derive(Default)]
+struct RowDeduplication {
+    overrides: HashMap<&'static str, bool>,
+}
+
+#[cfg(any(feature = "client-cache", test))]
+impl RowDeduplication {
+    fn set(&mut self, table_name: &'static str, deduplicate_rows: bool) {
+        self.overrides.insert(table_name, deduplicate_rows);
+    }
+
+    #[cfg(any(feature = "client-cache", test))]
+    fn get(&self, table_name: &'static str, connection_default: bool) -> bool {
+        self.overrides.get(table_name).copied().unwrap_or(connection_default)
+    }
+}
+
+#[cfg(test)]
+mod row_deduplication_tests {
+    use super::RowDeduplication;
+
+    #[test]
+    fn table_setting_overrides_connection_default() {
+        let mut policy = RowDeduplication::default();
+        assert!(policy.get("players", true));
+        assert!(!policy.get("players", false));
+
+        policy.set("players", false);
+        assert!(!policy.get("players", true));
+        assert!(policy.get("messages", true));
+
+        policy.set("players", true);
+        assert!(policy.get("players", false));
+        assert!(!policy.get("messages", false));
+    }
+}
+
+#[cfg(all(test, feature = "client-cache"))]
+mod cached_tests {
+    use super::*;
+
+    fn row(value: u8) -> WithBsatn<u8> {
+        WithBsatn {
+            bsatn: Bytes::from(vec![value]),
+            row: value,
+        }
+    }
+
+    fn row_u16(value: u16) -> WithBsatn<u16> {
+        WithBsatn {
+            bsatn: Bytes::copy_from_slice(&value.to_le_bytes()),
+            row: value,
+        }
+    }
+
+    #[test]
+    fn disabling_deduplication_preserves_duplicate_events_but_not_cache_rows() {
+        let mut cache = TableCache::default();
+        let mut update = TableUpdate::default();
+        update.inserts.push(row(1));
+        update.inserts.push(row(1));
+
+        let applied = cache.apply_diff_without_ref_counts(&update);
+
+        assert_eq!(applied.inserts().copied().collect::<Vec<_>>(), vec![1, 1]);
+        assert_eq!(cache.entries.len(), 1);
+        assert!(matches!(cache.entries, TableEntries::Uncounted(_)));
+
+        let mut delete = TableUpdate::default();
+        delete.deletes.push(row(1));
+        let applied = cache.apply_diff_without_ref_counts(&delete);
+        assert_eq!(applied.deletes().copied().collect::<Vec<_>>(), vec![1]);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn disabling_deduplication_releases_existing_ref_counts() {
+        let mut cache = TableCache::default();
+        let mut update = TableUpdate::default();
+        update.inserts.push(row(1));
+        update.inserts.push(row(1));
+        cache.apply_diff(&update);
+
+        let TableEntries::RefCounted(entries) = &cache.entries else {
+            panic!("table should initially use reference-counted storage");
+        };
+        assert_eq!(entries.values().next().unwrap().ref_count, 2);
+
+        cache.use_ref_counts(false);
+        let TableEntries::Uncounted(entries) = &cache.entries else {
+            panic!("table should release reference counts when deduplication is disabled");
+        };
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn disabling_deduplication_preserves_duplicate_updates() {
+        let mut cache = TableCache::default();
+        let mut initial = TableUpdate::default();
+        initial.inserts.push(row(1));
+        initial.inserts.push(row(1));
+        cache.apply_diff_without_ref_counts(&initial);
+
+        let mut update = TableUpdate::default();
+        update.deletes.push(row(1));
+        update.deletes.push(row(1));
+        update.inserts.push(row(2));
+        update.inserts.push(row(2));
+        let applied = cache.apply_diff_without_ref_counts(&update).with_updates_by_pk(|_| &());
+
+        assert_eq!(
+            applied.updates().map(|(old, new)| (*old, *new)).collect::<Vec<_>>(),
+            vec![(1, 2), (1, 2)]
+        );
+    }
+
+    #[test]
+    fn insert_delete_pair_suppresses_the_insert_event() {
+        let mut cache = TableCache::default();
+        let mut update = TableUpdate::default();
+        update.inserts.push(row(1));
+        update.deletes.push(row(1));
+
+        let applied = cache.apply_diff(&update);
+
+        assert!(applied.inserts().next().is_none());
+        assert_eq!(applied.deletes().copied().collect::<Vec<_>>(), vec![1]);
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn cancels_large_batch_of_insert_events() {
+        const ROW_COUNT: u16 = 1024;
+
+        let mut cache = TableCache::default();
+        let mut update = TableUpdate::default();
+        update.inserts = (0..ROW_COUNT).map(row_u16).collect();
+        update.deletes = (0..ROW_COUNT).rev().map(row_u16).collect();
+
+        let applied = cache.apply_diff(&update);
+
+        assert!(applied.inserts().next().is_none());
+        assert_eq!(applied.deletes().count(), ROW_COUNT as usize);
+        assert!(cache.entries.is_empty());
+    }
+}
+
+#[cfg(feature = "client-cache")]
 impl<Row: Clone + Debug + Send + Sync + 'static> TableCache<Row> {
-    fn handle_delete<'r>(
-        &mut self,
-        inserts: &mut RowEventMap<'_, Row>,
-        deletes: &mut RowEventMap<'r, Row>,
-        delete: &'r WithBsatn<Row>,
-    ) {
+    fn use_ref_counts(&mut self, enabled: bool) {
+        self.entries.use_ref_counts(enabled);
+    }
+
+    fn apply_diff_without_ref_counts<'r>(&mut self, diff: &'r TableUpdate<Row>) -> TableAppliedDiff<'r, Row> {
+        self.use_ref_counts(false);
+        let TableEntries::Uncounted(entries) = &mut self.entries else {
+            unreachable!()
+        };
+
+        let mut deleted_rows = Vec::new();
+        for delete in &diff.deletes {
+            if entries.remove(&delete.bsatn).is_some() {
+                deleted_rows.push(&delete.row);
+            }
+        }
+
+        let mut inserted_rows = Vec::new();
+        for insert in &diff.inserts {
+            match entries.entry(insert.bsatn.clone()) {
+                Entry::Occupied(mut entry) => {
+                    entry.insert(insert.row.clone());
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(insert.row.clone());
+                    inserted_rows.push(&insert.row);
+                }
+            }
+        }
+
+        for index in self.unique_indices.values_mut() {
+            for row in &deleted_rows {
+                index.remove_row(row);
+            }
+            for row in &inserted_rows {
+                index.add_row((*row).clone());
+            }
+        }
+
+        TableAppliedDiff::from_raw(diff)
+    }
+
+    fn handle_delete<'r>(&mut self, deletes: &mut RowEventList<'r, Row>, delete: &'r WithBsatn<Row>) {
+        let extra_logging = self.extra_logging.clone();
+        let TableEntries::RefCounted(entries) = &mut self.entries else {
+            unreachable!("reference-counted update applied to an uncounted table")
+        };
         // Extract the entry and decrement the `ref_count`.
         // Only create a delete event if `ref_count = 0`.
-        let Entry::Occupied(mut entry) = self.entries.entry(delete.bsatn.clone()) else {
-            self.debug_log(|file| {
+        let Entry::Occupied(mut entry) = entries.entry(delete.bsatn.clone()) else {
+            debug_log(&extra_logging, |file| {
                 writeln!(file, "`handle_delete` for table with row type {}: a delete update should correspond to an existing row in the table cache, but the row {delete:?} was not present", std::any::type_name::<Row>())?;
                 writeln!(file, "table contents:")?;
-                for (bsatn, RowEntry { row, ref_count }) in self.entries.iter() {
+                for (bsatn, RowEntry { row, ref_count }) in entries.iter() {
                     writeln!(file, "\t{bsatn:?}\n\t\t{row:?}\n\t\tref_count {ref_count}")?;
                 }
                 Ok(())
@@ -224,7 +560,7 @@ impl<Row: Clone + Debug + Send + Sync + 'static> TableCache<Row> {
         *ref_count -= 1;
         if *ref_count == 0 {
             entry.remove();
-            deletes.insert(&delete.bsatn, &delete.row);
+            deletes.push((&delete.bsatn, &delete.row));
 
             // While one might think the host never sends us a delete-insert pair for the same row `r0`,
             // it actually may, given the right joins.
@@ -240,16 +576,19 @@ impl<Row: Clone + Debug + Send + Sync + 'static> TableCache<Row> {
             // - deletes a row `t0` which results in `delete r0` being sent.
             // - inserts a row `s0` which results in `insert r0` being sent.
             //
-            // That is, we end up with `[delete r0, insert r0]`.
-            inserts.remove(&*delete.bsatn);
+            // That is, we end up with `[delete r0, insert r0]`. These pairs are
+            // removed in one batch after all deletes have been applied.
         }
     }
 
-    fn handle_insert<'r>(&mut self, inserts: &mut RowEventMap<'r, Row>, insert: &'r WithBsatn<Row>) {
-        let entry = self.entries.entry(insert.bsatn.clone());
+    fn handle_insert<'r>(&mut self, inserts: &mut RowEventList<'r, Row>, insert: &'r WithBsatn<Row>) {
+        let TableEntries::RefCounted(entries) = &mut self.entries else {
+            unreachable!("reference-counted update applied to an uncounted table")
+        };
+        let entry = entries.entry(insert.bsatn.clone());
         let entry = entry.or_insert_with(|| {
             // First time inserting this row, so let's add an insertion event.
-            inserts.insert(&insert.bsatn, &insert.row);
+            inserts.push((&insert.bsatn, &insert.row));
             RowEntry {
                 row: insert.row.clone(),
                 ref_count: 0,
@@ -267,6 +606,7 @@ impl<Row: Clone + Debug + Send + Sync + 'static> TableCache<Row> {
     /// The caller should use [`TableAppliedDiff::with_updates_by_pk`] to merge delete/insert pairs
     /// and populate the `update_*` fields.
     fn apply_diff<'r>(&mut self, diff: &'r TableUpdate<Row>) -> TableAppliedDiff<'r, Row> {
+        self.use_ref_counts(true);
         // Apply all inserts and collect all `ref_count: 0 -> 1` events.
         // Inserts must be applied before deletes to avoid the panic in `handle_delete`
         // and to avoid duplicate index insertion errors.
@@ -278,17 +618,22 @@ impl<Row: Clone + Debug + Send + Sync + 'static> TableCache<Row> {
         // Apply all deletes and collect all `ref_count -> 0` events.
         let mut delete_events = <_>::default();
         for delete in &diff.deletes {
-            self.handle_delete(&mut insert_events, &mut delete_events, delete);
+            self.handle_delete(&mut delete_events, delete);
+        }
+
+        if !insert_events.is_empty() && !delete_events.is_empty() {
+            let deleted_rows = delete_events.iter().map(|(bsatn, _)| *bsatn).collect::<HashSet<_>>();
+            insert_events.retain(|(bsatn, _)| !deleted_rows.contains(bsatn));
         }
 
         // Update indices.
         // We apply deletes first to make space for later insertions
         // and to avoid duplicates in any unique index.
         for index in self.unique_indices.values_mut() {
-            for row in delete_events.values() {
+            for (_, row) in &delete_events {
                 index.remove_row(row);
             }
-            for &row in insert_events.values() {
+            for &(_, row) in &insert_events {
                 index.add_row(row.clone());
             }
         }
@@ -298,6 +643,7 @@ impl<Row: Clone + Debug + Send + Sync + 'static> TableCache<Row> {
             inserts: insert_events,
             update_deletes: Vec::new(),
             update_inserts: Vec::new(),
+            initial_rows: diff.is_initial().then_some(&diff.inserts),
         }
     }
 
@@ -340,24 +686,55 @@ pub struct ClientCache<M: SpacetimeModule + ?Sized> {
     /// "keyed" on the type `HashMap<&'static str, TableCache<Row>`.
     ///
     /// The strings are table names, since we may have multiple tables with the same row type.
+    #[cfg(feature = "client-cache")]
     tables: Map<dyn Any + Send + Sync>,
 
     /// Clone of the [`crate::db_connection::DbContextImpl::extra_logging`].
+    #[cfg(feature = "client-cache")]
     extra_logging: Option<SharedCell<File>>,
 
+    /// Per-table overrides for the connection's row-hook deduplication policy.
+    #[cfg(feature = "client-cache")]
+    row_deduplication: RowDeduplication,
     _module: PhantomData<M>,
 }
 
 impl<M: SpacetimeModule> ClientCache<M> {
     pub(crate) fn new(extra_logging: Option<SharedCell<File>>) -> Self {
+        #[cfg(not(feature = "client-cache"))]
+        let _ = &extra_logging;
         Self {
+            #[cfg(feature = "client-cache")]
             tables: Map::new(),
+            #[cfg(feature = "client-cache")]
             extra_logging,
+            #[cfg(feature = "client-cache")]
+            row_deduplication: RowDeduplication::default(),
             _module: PhantomData,
         }
     }
 
+    fn set_row_deduplication<Row: InModule<Module = M> + Clone + Debug + Send + Sync + 'static>(
+        &mut self,
+        table_name: &'static str,
+        deduplicate_rows: bool,
+    ) {
+        #[cfg(feature = "client-cache")]
+        {
+            self.row_deduplication.set(table_name, deduplicate_rows);
+            self.get_or_make_table::<Row>(table_name)
+                .use_ref_counts(deduplicate_rows);
+        }
+        #[cfg(not(feature = "client-cache"))]
+        let _ = (table_name, deduplicate_rows);
+    }
+
+    #[cfg(feature = "client-cache")]
+    fn row_deduplication(&self, table_name: &'static str, connection_default: bool) -> bool {
+        self.row_deduplication.get(table_name, connection_default)
+    }
     /// Get a handle on the [`TableCache`] which stores rows of type `Row` for the table `table_name`.
+    #[cfg(feature = "client-cache")]
     pub(crate) fn get_table<Row: InModule<Module = M> + Send + Sync + 'static>(
         &self,
         table_name: &'static str,
@@ -369,6 +746,7 @@ impl<M: SpacetimeModule> ClientCache<M> {
 
     /// Called internally when updating the client cache in response to WebSocket messages,
     /// and by the codegen when initializing the client cache during [`crate::DbConnectionBuilder::build`].
+    #[cfg(feature = "client-cache")]
     pub fn get_or_make_table<Row: InModule<Module = M> + Send + Sync + 'static>(
         &mut self,
         table_name: &'static str,
@@ -387,13 +765,88 @@ impl<M: SpacetimeModule> ClientCache<M> {
         table_name: &'static str,
         diff: &'r TableUpdate<Row>,
     ) -> TableAppliedDiff<'r, Row> {
-        if diff.is_empty() {
+        self.apply_diff_to_table_with_deduplication(table_name, diff, true)
+    }
+
+    /// Apply a table diff, optionally bypassing row reference counting and hook deduplication.
+    pub fn apply_diff_to_table_with_deduplication<
+        'r,
+        Row: InModule<Module = M> + Clone + Debug + Send + Sync + 'static,
+    >(
+        &mut self,
+        table_name: &'static str,
+        diff: &'r TableUpdate<Row>,
+        connection_default: bool,
+    ) -> TableAppliedDiff<'r, Row> {
+        if diff.is_empty() && !diff.is_initial() {
             return <_>::default();
         }
 
-        let table = self.get_or_make_table::<Row>(table_name);
+        #[cfg(feature = "client-cache")]
+        {
+            let deduplicate_rows = self.row_deduplication(table_name, connection_default);
+            let table = self.get_or_make_table::<Row>(table_name);
+            if deduplicate_rows {
+                table.apply_diff(diff)
+            } else {
+                table.apply_diff_without_ref_counts(diff)
+            }
+        }
 
-        table.apply_diff(diff)
+        #[cfg(not(feature = "client-cache"))]
+        {
+            let _ = (table_name, connection_default);
+            TableAppliedDiff::from_raw(diff)
+        }
+    }
+
+    /// Apply a table diff while using the row's primary key for cacheless refcount tracking.
+    pub fn apply_diff_to_table_with_pk<
+        'r,
+        Row: InModule<Module = M> + Clone + Debug + Send + Sync + 'static,
+        Pk: Serialize + ?Sized,
+    >(
+        &mut self,
+        table_name: &'static str,
+        diff: &'r TableUpdate<Row>,
+        derive_pk: impl Fn(&Row) -> &Pk,
+    ) -> TableAppliedDiff<'r, Row> {
+        self.apply_diff_to_table_with_pk_and_deduplication(table_name, diff, derive_pk, true)
+    }
+
+    /// Apply a table diff with a primary key, optionally bypassing row reference counting and hook deduplication.
+    pub fn apply_diff_to_table_with_pk_and_deduplication<
+        'r,
+        Row: InModule<Module = M> + Clone + Debug + Send + Sync + 'static,
+        Pk: Serialize + ?Sized,
+    >(
+        &mut self,
+        table_name: &'static str,
+        diff: &'r TableUpdate<Row>,
+        derive_pk: impl Fn(&Row) -> &Pk,
+        connection_default: bool,
+    ) -> TableAppliedDiff<'r, Row> {
+        if diff.is_empty() && !diff.is_initial() {
+            return <_>::default();
+        }
+
+        #[cfg(feature = "client-cache")]
+        {
+            let deduplicate_rows = self.row_deduplication(table_name, connection_default);
+            let _ = derive_pk;
+            let table = self.get_or_make_table::<Row>(table_name);
+            if deduplicate_rows {
+                table.apply_diff(diff)
+            } else {
+                table.apply_diff_without_ref_counts(diff)
+            }
+        }
+
+        #[cfg(not(feature = "client-cache"))]
+        {
+            let _ = (table_name, connection_default, derive_pk);
+            TableAppliedDiff::from_raw(diff)
+        }
     }
 }
 
@@ -426,8 +879,17 @@ impl<Row: InModule> Clone for TableHandle<Row> {
     }
 }
 
-impl<Row: InModule + Send + Sync + Clone + 'static> TableHandle<Row> {
+impl<Row: InModule + Send + Sync + Clone + Debug + 'static> TableHandle<Row> {
+    /// Override row reference counting and hook deduplication for this table.
+    pub fn set_row_deduplication(&self, deduplicate_rows: bool) {
+        self.client_cache
+            .lock()
+            .unwrap()
+            .set_row_deduplication::<Row>(self.table_name, deduplicate_rows);
+    }
+
     /// Read something out of the [`TableCache`] which this `TableHandle` accesses.
+    #[cfg(feature = "client-cache")]
     fn with_table_cache<Res>(&self, get: impl FnOnce(&TableCache<Row>) -> Res) -> Res {
         let client_cache = self.client_cache.lock().unwrap();
         client_cache
@@ -437,19 +899,46 @@ impl<Row: InModule + Send + Sync + Clone + 'static> TableHandle<Row> {
     }
 
     /// Called by the autogenerated implementation of the [`crate::Table`] method of the same name.
+    #[cfg(feature = "client-cache")]
     pub fn count(&self) -> u64 {
         self.with_table_cache(|table| table.entries.len() as u64)
     }
 
     /// Called by the autogenerated implementation of the [`crate::Table`] method of the same name.
+    #[cfg(feature = "client-cache")]
     pub fn iter(&self) -> impl Iterator<Item = Row> + use<Row> {
-        self.with_table_cache(|table| table.entries.values().map(|e| e.row.clone()).collect::<Vec<_>>())
-            .into_iter()
+        self.with_table_cache(|table| match &table.entries {
+            TableEntries::RefCounted(entries) => entries.values().map(|entry| entry.row.clone()).collect::<Vec<_>>(),
+            TableEntries::Uncounted(entries) => entries.values().cloned().collect::<Vec<_>>(),
+        })
+        .into_iter()
     }
 
     /// See [`DbContextImpl::queue_mutation`].
     fn queue_mutation(&self, mutation: PendingMutation<Row::Module>) {
         self.pending_mutations.unbounded_send(mutation).unwrap();
+    }
+
+    pub fn on_initial(
+        &self,
+        mut callback: impl FnMut(&<Row::Module as SpacetimeModule>::EventContext, &[Row]) + Send + 'static,
+    ) -> CallbackId {
+        let callback_id = CallbackId::get_next();
+        self.queue_mutation(PendingMutation::AddInitialCallback {
+            table: self.table_name,
+            callback: Box::new(move |ctx, rows| {
+                callback(ctx, rows.downcast_ref::<Vec<Row>>().unwrap());
+            }),
+            callback_id,
+        });
+        callback_id
+    }
+
+    pub fn remove_on_initial(&self, callback: CallbackId) {
+        self.queue_mutation(PendingMutation::RemoveInitialCallback {
+            table: self.table_name,
+            callback_id: callback,
+        });
     }
 
     /// Called by the autogenerated implementation of the [`crate::Table`] method of the same name.
@@ -529,6 +1018,7 @@ impl<Row: InModule + Send + Sync + Clone + 'static> TableHandle<Row> {
     }
 
     /// Called by autogenerated unique index access methods.
+    #[cfg(feature = "client-cache")]
     pub fn get_unique_constraint<Col>(&self, constraint_name: &'static str) -> UniqueConstraintHandle<Row, Col> {
         UniqueConstraintHandle {
             table_handle: self.clone(),
@@ -547,12 +1037,14 @@ impl<Row: InModule + Send + Sync + Clone + 'static> TableHandle<Row> {
 /// or an index within it. (No such index currently exists, anyways.)
 /// Instead, they hold a handle on the whole [`ClientCache`],
 /// and acquire short-lived exclusive access to it during operations.
+#[cfg(feature = "client-cache")]
 pub struct UniqueConstraintHandle<Row: InModule, Col> {
     table_handle: TableHandle<Row>,
     unique_index_name: &'static str,
     _phantom: PhantomData<HashMap<Col, Row>>,
 }
 
+#[cfg(feature = "client-cache")]
 impl<
         Row: Clone + Debug + InModule + Send + Sync + 'static,
         Col: std::any::Any + Eq + std::hash::Hash + Clone + Send + Sync + std::fmt::Debug + 'static,
@@ -565,6 +1057,7 @@ impl<
 }
 
 /// [`UniqueIndexImpl`], but with its `Col` type parameter erased.
+#[cfg(feature = "client-cache")]
 pub trait UniqueIndexDyn: Send + Sync + 'static {
     /// The `Row` type parameter to [`UniqueIndexImpl`]; the type of rows in the indexed table.
     type Row: Clone + Send + Sync + 'static;
@@ -588,6 +1081,7 @@ pub trait UniqueIndexDyn: Send + Sync + 'static {
 }
 
 /// A unique index on a table with rows of type `Row`, indexing a column of type `Col`.
+#[cfg(feature = "client-cache")]
 pub struct UniqueIndexImpl<Row, Col> {
     /// All the rows in the table, indexed by their unique column.
     ///
@@ -605,6 +1099,7 @@ pub struct UniqueIndexImpl<Row, Col> {
     get_unique_col: fn(&Row) -> &Col,
 }
 
+#[cfg(feature = "client-cache")]
 impl<Row, Col> UniqueIndexDyn for UniqueIndexImpl<Row, Col>
 where
     Row: Clone + Send + Sync + 'static,
@@ -632,5 +1127,62 @@ where
             .downcast_ref::<Col>()
             .expect("UniqueIndexDyn::find_row with key of incorrect type");
         self.rows.get(col)
+    }
+}
+
+#[cfg(all(test, not(feature = "client-cache")))]
+mod tests {
+    use super::*;
+
+    fn row(value: u8) -> WithBsatn<u8> {
+        WithBsatn {
+            bsatn: Bytes::from(vec![value]),
+            row: value,
+        }
+    }
+
+    #[test]
+    fn cacheless_mode_preserves_all_row_events() {
+        let mut update = TableUpdate::default();
+        update.inserts.push(row(1));
+        update.inserts.push(row(1));
+        update.deletes.push(row(1));
+
+        let applied = TableAppliedDiff::from_raw(&update);
+
+        assert_eq!(applied.inserts().copied().collect::<Vec<_>>(), vec![1, 1]);
+        assert_eq!(applied.deletes().copied().collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct PkRow {
+        id: u8,
+        value: u8,
+    }
+
+    fn pk_row(id: u8, value: u8) -> WithBsatn<PkRow> {
+        WithBsatn {
+            bsatn: Bytes::from(vec![id, value]),
+            row: PkRow { id, value },
+        }
+    }
+
+    #[test]
+    fn cacheless_mode_derives_updates_without_tracking_rows() {
+        let mut update = TableUpdate::default();
+        update.deletes.push(pk_row(1, 10));
+        update.deletes.push(pk_row(1, 10));
+        update.inserts.push(pk_row(1, 20));
+        update.inserts.push(pk_row(1, 20));
+        let applied = TableAppliedDiff::from_raw(&update).with_updates_by_pk(|row| &row.id);
+        assert_eq!(
+            applied.updates().collect::<Vec<_>>(),
+            vec![
+                (&PkRow { id: 1, value: 10 }, &PkRow { id: 1, value: 20 }),
+                (&PkRow { id: 1, value: 10 }, &PkRow { id: 1, value: 20 })
+            ]
+        );
+        assert!(applied.deletes().next().is_none());
+        assert!(applied.inserts().next().is_none());
     }
 }

@@ -18,6 +18,8 @@
 use crate::{client_cache::TableAppliedDiff, error::InternalError, spacetime_module::SpacetimeModule};
 use bytes::Bytes;
 use spacetimedb_data_structures::map::HashMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::{
     any::Any,
     sync::atomic::{AtomicUsize, Ordering},
@@ -70,24 +72,44 @@ impl<M: SpacetimeModule> DbCallbacks<M> {
     }
 
     /// Invoke all row callbacks for rows modified by `applied_diff` for the table `table_name`.
-    pub fn invoke_table_row_callbacks<Row: Any>(
+    pub fn has_callbacks(&mut self, table_name: &'static str) -> bool {
+        let table_callbacks = self.get_table_callbacks(table_name);
+
+        table_callbacks.has_callbacks.load(Ordering::Relaxed)
+    }
+
+    /// Invoke all row callbacks for rows modified by `applied_diff` for the table `table_name`.
+    pub fn invoke_table_row_callbacks<Row: Any + Clone>(
         &mut self,
         table_name: &'static str,
         applied_diff: &TableAppliedDiff<Row>,
         event: &M::EventContext,
     ) {
-        if applied_diff.is_empty() {
+        if applied_diff.is_empty() && applied_diff.initial_rows().is_none() {
             return;
         }
         let table_callbacks = self.get_table_callbacks(table_name);
-        for row in applied_diff.inserts() {
-            table_callbacks.invoke_on_insert(event, row);
+        if !table_callbacks.on_initial.is_empty() {
+            if let Some(initial_rows) = applied_diff.initial_rows() {
+                let rows = initial_rows.iter().map(|row| row.row.clone()).collect::<Vec<_>>();
+                table_callbacks.invoke_on_initial(event, &rows);
+                return;
+            }
         }
-        for row in applied_diff.deletes() {
-            table_callbacks.invoke_on_delete(event, row);
+        if !table_callbacks.on_insert.is_empty() {
+            for row in applied_diff.inserts() {
+                table_callbacks.invoke_on_insert(event, row);
+            }
         }
-        for (del, ins) in applied_diff.updates() {
-            table_callbacks.invoke_on_update(event, del, ins);
+        if !table_callbacks.on_delete.is_empty() {
+            for row in applied_diff.deletes() {
+                table_callbacks.invoke_on_delete(event, row);
+            }
+        }
+        if !table_callbacks.on_update.is_empty() {
+            for (del, ins) in applied_diff.updates() {
+                table_callbacks.invoke_on_update(event, del, ins);
+            }
         }
     }
 }
@@ -101,6 +123,9 @@ pub(crate) type RowCallback<M> = Box<dyn FnMut(&<M as SpacetimeModule>::EventCon
 
 type InsertCallbackMap<M> = HashMap<CallbackId, RowCallback<M>>;
 type DeleteCallbackMap<M> = HashMap<CallbackId, RowCallback<M>>;
+
+pub(crate) type InitialCallback<M> = Box<dyn FnMut(&<M as SpacetimeModule>::EventContext, &dyn Any) + Send + 'static>;
+type InitialCallbackMap<M> = HashMap<CallbackId, InitialCallback<M>>;
 
 /// An update callback for a row defined by the module `M`.
 ///
@@ -117,32 +142,51 @@ type UpdateCallbackMap<M> = HashMap<CallbackId, UpdateCallback<M>>;
 /// We store a set of update callbacks for all tables, even those which do not have a primary key field.
 /// The public codegen interface makes it statically impossible to register or invoke such a callback.
 pub(crate) struct TableCallbacks<M: SpacetimeModule> {
+    on_initial: InitialCallbackMap<M>,
     on_insert: InsertCallbackMap<M>,
     on_delete: DeleteCallbackMap<M>,
     on_update: UpdateCallbackMap<M>,
+    has_callbacks: Arc<AtomicBool>,
 }
 
 impl<M: SpacetimeModule> Default for TableCallbacks<M> {
     fn default() -> Self {
         Self {
+            on_initial: Default::default(),
             on_insert: Default::default(),
             on_delete: Default::default(),
             on_update: Default::default(),
+            has_callbacks: Arc::new(AtomicBool::default()),
         }
     }
 }
 
 impl<M: SpacetimeModule> TableCallbacks<M> {
+    pub(crate) fn register_on_initial(&mut self, callback_id: CallbackId, callback: InitialCallback<M>) {
+        self.on_initial.insert(callback_id, callback);
+        self.has_callbacks.store(true, Ordering::SeqCst);
+    }
+
     pub(crate) fn register_on_insert(&mut self, callback_id: CallbackId, callback: RowCallback<M>) {
         self.on_insert.insert(callback_id, callback);
+        self.has_callbacks.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn register_on_delete(&mut self, callback_id: CallbackId, callback: RowCallback<M>) {
         self.on_delete.insert(callback_id, callback);
+        self.has_callbacks.store(true, Ordering::SeqCst);
     }
 
     pub(crate) fn register_on_update(&mut self, callback_id: CallbackId, callback: UpdateCallback<M>) {
         self.on_update.insert(callback_id, callback);
+        self.has_callbacks.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn check_if_still_has_callbacks(&self) -> bool {
+        !self.on_initial.is_empty()
+            || !self.on_insert.is_empty()
+            || !self.on_delete.is_empty()
+            || !self.on_update.is_empty()
     }
 
     pub(crate) fn remove_on_insert(&mut self, callback_id: CallbackId) {
@@ -155,6 +199,21 @@ impl<M: SpacetimeModule> TableCallbacks<M> {
             .on_insert
             .remove(&callback_id)
             .expect("Attempt to remove non-existent insert callback");
+
+        if !self.check_if_still_has_callbacks() {
+            self.has_callbacks.store(false, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn remove_on_initial(&mut self, callback_id: CallbackId) {
+        let _ = self
+            .on_initial
+            .remove(&callback_id)
+            .expect("Attempt to remove non-existent initial callback");
+
+        if !self.check_if_still_has_callbacks() {
+            self.has_callbacks.store(false, Ordering::SeqCst);
+        }
     }
 
     pub(crate) fn remove_on_delete(&mut self, callback_id: CallbackId) {
@@ -167,6 +226,10 @@ impl<M: SpacetimeModule> TableCallbacks<M> {
             .on_delete
             .remove(&callback_id)
             .expect("Attempt to remove non-existent delete callback");
+
+        if !self.check_if_still_has_callbacks() {
+            self.has_callbacks.store(false, Ordering::SeqCst);
+        }
     }
 
     pub(crate) fn remove_on_update(&mut self, callback_id: CallbackId) {
@@ -179,11 +242,21 @@ impl<M: SpacetimeModule> TableCallbacks<M> {
             .on_update
             .remove(&callback_id)
             .expect("Attempt to remove non-existent update callback");
+
+        if !self.check_if_still_has_callbacks() {
+            self.has_callbacks.store(false, Ordering::SeqCst);
+        }
     }
 
     fn invoke_on_insert(&mut self, ctx: &M::EventContext, row: &dyn Any) {
         for callback in self.on_insert.values_mut() {
             callback(ctx, row);
+        }
+    }
+
+    fn invoke_on_initial(&mut self, ctx: &M::EventContext, rows: &dyn Any) {
+        for callback in self.on_initial.values_mut() {
+            callback(ctx, rows);
         }
     }
 

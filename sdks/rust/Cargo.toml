@@ -9,7 +9,8 @@ rust-version.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = []
+default = ["client-cache"]
+client-cache = ["dep:anymap3"]
 allow_loopback_http_for_tests = ["spacetimedb-testing/allow_loopback_http_for_tests"]
 browser = [
     "dep:getrandom",
@@ -33,7 +34,7 @@ spacetimedb-metrics.workspace = true
 spacetimedb-query-builder.workspace = true
 
 thiserror.workspace = true
-anymap3 = "1.0.1"
+anymap3 = { version = "1.0.1", optional = true }
 brotli.workspace = true
 bytes.workspace = true
 flate2.workspace = true
@@ -58,10 +59,7 @@ web-sys = { version = "0.3.77", features = ["HtmlDocument"], optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 home.workspace = true
 tokio.workspace = true
-tokio-tungstenite.workspace = true
-# native-tls 0.2.17 fails to compile with Rust 1.93.0 due non-exhaustive
-# matching in upstream code. Pin until upstream ships a compatible release.
-native-tls = "=0.2.14"
+tokio-websockets.workspace = true
 
 [dev-dependencies]
 futures-channel.workspace = true

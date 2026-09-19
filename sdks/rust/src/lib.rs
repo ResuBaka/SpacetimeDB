@@ -31,6 +31,20 @@ pub use error::{Error, Result};
 pub use event::{Event, ReducerEvent, Status};
 pub use table::{EventTable, Table, TableAccessor, TableWithPrimaryKey};
 
+#[doc(hidden)]
+#[cfg(feature = "client-cache")]
+#[macro_export]
+macro_rules! __if_client_cache {
+    ($($item:item)*) => { $($item)* };
+}
+
+#[doc(hidden)]
+#[cfg(not(feature = "client-cache"))]
+#[macro_export]
+macro_rules! __if_client_cache {
+    ($($item:item)*) => {};
+}
+
 pub use spacetime_module::SubscriptionHandle;
 pub use spacetimedb_client_api_messages::websocket::v1::Compression;
 pub use spacetimedb_lib::{ConnectionId, Identity, ScheduleAt, TimeDuration, Timestamp, Uuid};
@@ -49,8 +63,11 @@ pub mod __codegen {
     pub use spacetimedb_query_builder as __query_builder;
     pub use spacetimedb_sats as __sats;
 
+    pub use crate::__if_client_cache;
     pub use crate::callbacks::{CallbackId, DbCallbacks};
-    pub use crate::client_cache::{ClientCache, TableAppliedDiff, TableHandle, UniqueConstraintHandle};
+    #[cfg(feature = "client-cache")]
+    pub use crate::client_cache::UniqueConstraintHandle;
+    pub use crate::client_cache::{ClientCache, TableAppliedDiff, TableHandle};
     pub use crate::db_connection::DbContextImpl;
     pub use crate::error::{Error, InternalError, Result};
     pub use crate::spacetime_module::{

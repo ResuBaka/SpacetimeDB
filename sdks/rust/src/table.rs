@@ -46,9 +46,11 @@ pub trait TableLike {
     type EventContext;
 
     /// The number of subscribed rows in the client cache.
+    #[cfg(feature = "client-cache")]
     fn count(&self) -> u64;
 
     /// An iterator over all the subscribed rows in the client cache.
+    #[cfg(feature = "client-cache")]
     fn iter(&self) -> impl Iterator<Item = Self::Row> + '_;
 }
 
@@ -120,13 +122,18 @@ pub trait Table {
     type EventContext;
 
     /// The number of subscribed rows in the client cache.
+    #[cfg(feature = "client-cache")]
     fn count(&self) -> u64;
 
     /// An iterator over all the subscribed rows in the client cache.
+    #[cfg(feature = "client-cache")]
     fn iter(&self) -> impl Iterator<Item = Self::Row> + '_;
 
     type InsertCallbackId;
-    /// Register a callback to run whenever a subscribed row is inserted into the client cache.
+    /// Register a callback to run whenever an incremental subscription update inserts a row.
+    ///
+    /// Rows delivered in an initial subscription batch do not invoke this callback. Generated
+    /// table handles expose `on_initial` for observing those rows.
     ///
     /// The returned [`Self::InsertCallbackId`] can be passed to [`Self::remove_on_insert`]
     /// to cancel the callback.
@@ -192,9 +199,11 @@ pub trait EventTable {
     type EventContext;
 
     /// The number of subscribed rows in the client cache (always 0 for event tables).
+    #[cfg(feature = "client-cache")]
     fn count(&self) -> u64;
 
     /// An iterator over all the subscribed rows in the client cache (always empty for event tables).
+    #[cfg(feature = "client-cache")]
     fn iter(&self) -> impl Iterator<Item = Self::Row> + '_;
 
     type InsertCallbackId;

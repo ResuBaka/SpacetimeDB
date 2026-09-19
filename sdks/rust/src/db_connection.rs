@@ -22,8 +22,8 @@ use crate::{
     Event, ReducerEvent, Status,
     __codegen::{InternalError, Reducer},
     callbacks::{
-        CallbackId, DbCallbacks, ProcedureCallback, ProcedureCallbacks, ReducerCallback, ReducerCallbacks, RowCallback,
-        UpdateCallback,
+        CallbackId, DbCallbacks, InitialCallback, ProcedureCallback, ProcedureCallbacks, ReducerCallback,
+        ReducerCallbacks, RowCallback, UpdateCallback,
     },
     client_cache::{ClientCache, TableHandle},
     spacetime_module::{AbstractEventContext, AppliedDiff, DbConnection, DbUpdate, InModule, SpacetimeModule},
@@ -102,8 +102,10 @@ pub struct DbContextImpl<M: SpacetimeModule> {
     ///
     /// This may be none if we have not yet received the [`ws::v2::InitialConnection`] message.
     connection_id: SharedCell<Option<ConnectionId>>,
-
     pub(crate) extra_logging: Option<SharedCell<File>>,
+
+    /// Whether identical row occurrences are collapsed before invoking row hooks.
+    deduplicate_rows: bool,
 }
 
 impl<M: SpacetimeModule> Clone for DbContextImpl<M> {
@@ -123,6 +125,7 @@ impl<M: SpacetimeModule> Clone for DbContextImpl<M> {
             identity: Arc::clone(&self.identity),
             connection_id: Arc::clone(&self.connection_id),
             extra_logging: Option::<Arc<_>>::clone(&self.extra_logging),
+            deduplicate_rows: self.deduplicate_rows,
         }
     }
 }
@@ -255,8 +258,9 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
 
             ParsedMessage::SubscribeApplied {
                 query_set_id,
-                initial_update,
+                mut initial_update,
             } => {
+                initial_update.mark_initial();
                 self.apply_update(initial_update, |inner| {
                     let sub_event_ctx = self.make_event_ctx(());
                     inner.subscriptions.subscription_applied(&sub_event_ctx, query_set_id);
@@ -303,7 +307,7 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
         // so that it will be unlocked when callbacks run.
         let applied_diff = {
             let mut cache = self.cache.lock().unwrap();
-            update.apply_to_client_cache(&mut *cache)
+            update.apply_to_client_cache_with_row_deduplication(&mut *cache, self.deduplicate_rows)
         };
         let mut inner = self.inner.lock().unwrap();
 
@@ -494,6 +498,26 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
             }
 
             // Callback stuff: these all do what you expect.
+            PendingMutation::AddInitialCallback {
+                table,
+                callback_id,
+                callback,
+            } => {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .db_callbacks
+                    .get_table_callbacks(table)
+                    .register_on_initial(callback_id, callback);
+            }
+            PendingMutation::RemoveInitialCallback { table, callback_id } => {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .db_callbacks
+                    .get_table_callbacks(table)
+                    .remove_on_initial(callback_id);
+            }
             PendingMutation::AddInsertCallback {
                 table,
                 callback_id,
@@ -861,6 +885,8 @@ pub struct DbConnectionBuilder<M: SpacetimeModule> {
     additional_logging_path: Option<PathBuf>,
 
     params: WsParams,
+
+    deduplicate_rows: bool,
 }
 
 /// This process's global connection ID, which will be attacked to all connections it makes.
@@ -918,6 +944,7 @@ impl<M: SpacetimeModule> DbConnectionBuilder<M> {
             on_disconnect: None,
             additional_logging_path: None,
             params: <_>::default(),
+            deduplicate_rows: true,
         }
     }
 
@@ -1007,6 +1034,7 @@ but you must call one of them, or else the connection will never progress.
             pending_mutations_send,
             pending_mutations_recv,
             connection_id_override,
+            self.deduplicate_rows,
             extra_logging,
         ))
     }
@@ -1050,6 +1078,7 @@ but you must call one of them, or else the connection will never progress.
             pending_mutations_send,
             pending_mutations_recv,
             connection_id_override,
+            self.deduplicate_rows,
             extra_logging,
         ))
     }
@@ -1092,6 +1121,19 @@ but you must call one of them, or else the connection will never progress.
     /// Note however that this threshold is not guaranteed and may change without notice.
     pub fn with_compression(mut self, compression: ws::common::Compression) -> Self {
         self.params.compression = compression;
+        self
+    }
+
+    /// Configure whether identical row occurrences are reference-counted and collapsed before invoking row hooks.
+    ///
+    /// Deduplication is enabled by default. Disable it when the application needs to observe
+    /// and account for each occurrence produced by overlapping queries or bag-semantic joins.
+    /// When disabled, each occurrence is delivered to row hooks and the client cache uses set
+    /// membership rather than reference counts, so the first delete removes a duplicated row.
+    /// When the SDK is built without `client-cache`, row events are always delivered without
+    /// reference counting and this setting has no effect.
+    pub fn with_row_deduplication(mut self, deduplicate_rows: bool) -> Self {
+        self.deduplicate_rows = deduplicate_rows;
         self
     }
 
@@ -1229,9 +1271,12 @@ fn build_db_ctx<M: SpacetimeModule>(
     pending_mutations_send: mpsc::UnboundedSender<PendingMutation<M>>,
     pending_mutations_recv: SharedAsyncCell<mpsc::UnboundedReceiver<PendingMutation<M>>>,
     connection_id: Option<ConnectionId>,
+    deduplicate_rows: bool,
     extra_logging: Option<SharedCell<File>>,
 ) -> DbContextImpl<M> {
+    #[allow(unused_mut)]
     let mut cache = ClientCache::new(extra_logging.clone());
+    #[cfg(feature = "client-cache")]
     M::register_tables(&mut cache);
     let cache = Arc::new(StdMutex::new(cache));
 
@@ -1247,6 +1292,7 @@ fn build_db_ctx<M: SpacetimeModule>(
         identity: Arc::new(StdMutex::new(None)),
         connection_id: Arc::new(StdMutex::new(connection_id)),
         extra_logging,
+        deduplicate_rows,
     }
 }
 
@@ -1508,6 +1554,15 @@ pub(crate) enum PendingMutation<M: SpacetimeModule> {
         callback_id: CallbackId,
         callback: RowCallback<M>,
     },
+    AddInitialCallback {
+        table: &'static str,
+        callback_id: CallbackId,
+        callback: InitialCallback<M>,
+    },
+    RemoveInitialCallback {
+        table: &'static str,
+        callback_id: CallbackId,
+    },
     RemoveInsertCallback {
         table: &'static str,
         callback_id: CallbackId,
@@ -1559,6 +1614,16 @@ impl<M: SpacetimeModule> std::fmt::Debug for PendingMutation<M> {
                 .field("table", table)
                 .field("callback_id", callback_id)
                 .finish_non_exhaustive(),
+            PendingMutation::AddInitialCallback { table, callback_id, .. } => f
+                .debug_struct("PendingMutation::AddInitialCallback")
+                .field("table", table)
+                .field("callback_id", callback_id)
+                .finish_non_exhaustive(),
+            PendingMutation::RemoveInitialCallback { table, callback_id } => f
+                .debug_struct("PendingMutation::RemoveInitialCallback")
+                .field("table", table)
+                .field("callback_id", callback_id)
+                .finish(),
             PendingMutation::RemoveInsertCallback { table, callback_id } => f
                 .debug_struct("PendingMutation::RemoveInsertCallback")
                 .field("table", table)

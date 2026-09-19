@@ -128,6 +128,7 @@ impl __sdk::InModule for {type_name} {{
         let table_name_pascalcase = table.accessor_name.deref().to_case(Case::Pascal);
         let table_handle = table_name_pascalcase.clone() + "TableHandle";
         let table_accessor = table_name_pascalcase.clone() + "TableAccessor";
+        let initial_callback_id = table_name_pascalcase.clone() + "InitialCallbackId";
         let insert_callback_id = table_name_pascalcase.clone() + "InsertCallbackId";
         let delete_callback_id = table_name_pascalcase.clone() + "DeleteCallbackId";
         let accessor_trait = table_access_trait_name(&table.accessor_name);
@@ -180,6 +181,7 @@ impl {accessor_trait} for super::RemoteTables {{
     }}
 }}
 
+pub struct {initial_callback_id}(__sdk::CallbackId);
 pub struct {insert_callback_id}(__sdk::CallbackId);
 "
         );
@@ -200,16 +202,20 @@ impl<'ctx> __sdk::TableLike for {table_handle}<'ctx> {{
     type Row = {row_type};
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 {{ self.imp.count() }}
-    fn iter(&self) -> impl Iterator<Item = {row_type}> + '_ {{ self.imp.iter() }}
+    __sdk::__if_client_cache! {{
+        fn count(&self) -> u64 {{ self.imp.count() }}
+        fn iter(&self) -> impl Iterator<Item = {row_type}> + '_ {{ self.imp.iter() }}
+    }}
 }}
 
 impl<'ctx> __sdk::EventTable for {table_handle}<'ctx> {{
     type Row = {row_type};
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 {{ self.imp.count() }}
-    fn iter(&self) -> impl Iterator<Item = {row_type}> + '_ {{ self.imp.iter() }}
+    __sdk::__if_client_cache! {{
+        fn count(&self) -> u64 {{ self.imp.count() }}
+        fn iter(&self) -> impl Iterator<Item = {row_type}> + '_ {{ self.imp.iter() }}
+    }}
 
     type InsertCallbackId = {insert_callback_id};
 
@@ -253,16 +259,44 @@ impl<'ctx> __sdk::TableLike for {table_handle}<'ctx> {{
     type Row = {row_type};
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 {{ self.imp.count() }}
-    fn iter(&self) -> impl Iterator<Item = {row_type}> + '_ {{ self.imp.iter() }}
+    __sdk::__if_client_cache! {{
+        fn count(&self) -> u64 {{ self.imp.count() }}
+        fn iter(&self) -> impl Iterator<Item = {row_type}> + '_ {{ self.imp.iter() }}
+    }}
+}}
+
+impl<'ctx> {table_handle}<'ctx> {{
+    /// Override row reference counting and hook deduplication for this table.
+    ///
+    /// This takes precedence over [`__sdk::DbConnectionBuilder::with_row_deduplication`].
+    /// This has no effect when the SDK is built without `client-cache`, where row events are
+    /// always delivered without reference counting.
+    pub fn set_row_deduplication(&self, deduplicate_rows: bool) {{
+        self.imp.set_row_deduplication(deduplicate_rows)
+    }}
+
+    /// Register a callback for each initial table batch delivered by `SubscribeApplied`.
+    pub fn on_initial(
+        &self,
+        callback: impl FnMut(&super::EventContext, &[{row_type}]) + Send + 'static,
+    ) -> {initial_callback_id} {{
+        {initial_callback_id}(self.imp.on_initial(callback))
+    }}
+
+    /// Cancel a callback previously registered by [`Self::on_initial`].
+    pub fn remove_on_initial(&self, callback: {initial_callback_id}) {{
+        self.imp.remove_on_initial(callback.0)
+    }}
 }}
 
 impl<'ctx> __sdk::Table for {table_handle}<'ctx> {{
     type Row = {row_type};
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 {{ self.imp.count() }}
-    fn iter(&self) -> impl Iterator<Item = {row_type}> + '_ {{ self.imp.iter() }}
+    __sdk::__if_client_cache! {{
+        fn count(&self) -> u64 {{ self.imp.count() }}
+        fn iter(&self) -> impl Iterator<Item = {row_type}> + '_ {{ self.imp.iter() }}
+    }}
 
     type InsertCallbackId = {insert_callback_id};
 
@@ -378,6 +412,7 @@ impl<'ctx> __sdk::WithUpdate for {table_handle}<'ctx> {{
                 write!(
                     out,
                     "
+        __sdk::__if_client_cache! {{
         /// Access to the `{unique_field_name}` unique index on the table `{table_name}`,
         /// which allows point queries on the field of the same name
         /// via the [`{unique_constraint}::find`] method.
@@ -407,6 +442,7 @@ impl<'ctx> __sdk::WithUpdate for {table_handle}<'ctx> {{
                 self.imp.find(col_val)
             }}
         }}
+        }}
         "
                 );
             }
@@ -417,6 +453,7 @@ impl<'ctx> __sdk::WithUpdate for {table_handle}<'ctx> {{
         // Regardless of event-ness, emit `register_table` and `parse_table_update`.
         out.delimited_block(
             "
+__sdk::__if_client_cache! {
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
 ",
@@ -431,7 +468,8 @@ pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::Remote
                     );
                 }
             },
-            "}",
+            "}
+}",
         );
 
         out.newline();
@@ -1466,11 +1504,14 @@ impl __sdk::InModule for DbUpdate {{
     out.delimited_block(
         "impl __sdk::DbUpdate for DbUpdate {",
         |out| {
+            writeln!(
+                out,
+                "fn apply_to_client_cache(&self, cache: &mut __sdk::ClientCache<RemoteModule>) -> AppliedDiff<'_> {{\n    self.apply_to_client_cache_with_row_deduplication(cache, true)\n}}\n"
+            );
             out.delimited_block(
-                "fn apply_to_client_cache(&self, cache: &mut __sdk::ClientCache<RemoteModule>) -> AppliedDiff<'_> {
-                    let mut diff = AppliedDiff::default();
-                ",
+                "fn apply_to_client_cache_with_row_deduplication(&self, cache: &mut __sdk::ClientCache<RemoteModule>, deduplicate_rows: bool) -> AppliedDiff<'_> {",
                 |out| {
+                    writeln!(out, "let mut diff = AppliedDiff::default();");
                     for table in iter_tables(module, visibility) {
                         let field_name = table_method_name(&table.accessor_name);
                         if table.is_event {
@@ -1481,18 +1522,18 @@ impl __sdk::InModule for DbUpdate {{
                                 out,
                                 "diff.{field_name} = self.{field_name}.into_event_diff();",
                             );
-                        } else {
-                            let with_updates = table
-                                .primary_key
-                                .map(|col| {
-                                    let pk_field = table.get_column(col).unwrap().accessor_name.deref().to_case(Case::Snake);
-                                    format!(".with_updates_by_pk(|row| &row.{pk_field})")
-                                })
-                                .unwrap_or_default();
-
+                        } else if let Some(col) = table.primary_key {
+                            let row_type = type_ref_name(module, table.product_type_ref);
+                            let pk_field = table.get_column(col).unwrap().accessor_name.deref().to_case(Case::Snake);
                             writeln!(
                                 out,
-                                "diff.{field_name} = cache.apply_diff_to_table::<{}>({:?}, &self.{field_name}){with_updates};",
+                                "diff.{field_name} = cache.apply_diff_to_table_with_pk_and_deduplication::<{row_type}, _>({:?}, &self.{field_name}, |row| &row.{pk_field}, deduplicate_rows).with_updates_by_pk(|row| &row.{pk_field});",
+                                table.name.deref(),
+                            );
+                        } else {
+                            writeln!(
+                                out,
+                                "diff.{field_name} = cache.apply_diff_to_table_with_deduplication::<{}>({:?}, &self.{field_name}, deduplicate_rows);",
                                 type_ref_name(module, table.product_type_ref),
                                 table.name.deref(),
                             );
@@ -1500,27 +1541,33 @@ impl __sdk::InModule for DbUpdate {{
                     }
                     for view in iter_views(module) {
                         let field_name = table_method_name(&view.accessor_name);
-                        let with_updates = view
-                            .primary_key
-                            .map(|col| {
-                                let pk_field = view.return_columns[col.idx()]
-                                    .accessor_name
-                                    .deref()
-                                    .to_case(Case::Snake);
-                                format!(".with_updates_by_pk(|row| &row.{pk_field})")
-                            })
-                            .unwrap_or_default();
-                        writeln!(
-                            out,
-                            "diff.{field_name} = cache.apply_diff_to_table::<{}>({:?}, &self.{field_name}){with_updates};",
-                            type_ref_name(module, view.product_type_ref),
-                            view.name.deref(),
-                        );
+                        let row_type = type_ref_name(module, view.product_type_ref);
+                        if let Some(col) = view.primary_key {
+                            let pk_field = view.return_columns[col.idx()].accessor_name.deref().to_case(Case::Snake);
+                            writeln!(
+                                out,
+                                "diff.{field_name} = cache.apply_diff_to_table_with_pk_and_deduplication::<{row_type}, _>({:?}, &self.{field_name}, |row| &row.{pk_field}, deduplicate_rows).with_updates_by_pk(|row| &row.{pk_field});",
+                                view.name.deref(),
+                            );
+                        } else {
+                            writeln!(
+                                out,
+                                "diff.{field_name} = cache.apply_diff_to_table_with_deduplication::<{row_type}>({:?}, &self.{field_name}, deduplicate_rows);",
+                                view.name.deref(),
+                            );
+                        }
                     }
                 },
-                "
-                    diff
-                }\n",
+                "diff\n}\n",
+            );
+            out.delimited_block(
+                "fn mark_initial(&mut self) {",
+                |out| {
+                    for (_, accessor_name, _) in iter_table_names_and_types(module, visibility) {
+                        writeln!(out, "self.{}.mark_initial();", table_method_name(accessor_name));
+                    }
+                },
+                "}\n",
             );
 
             out.delimited_block(
@@ -1636,7 +1683,8 @@ impl __sdk::InModule for AppliedDiff<'_> {{
                     for (name, accessor_name, product_type_ref) in iter_table_names_and_types(module, visibility) {
                         writeln!(
                             out,
-                            "callbacks.invoke_table_row_callbacks::<{}>({:?}, &self.{}, event);",
+                            "if callbacks.has_callbacks({:?}) {{ callbacks.invoke_table_row_callbacks::<{}>({:?}, &self.{}, event); }}",
+                            name.deref(),
                             type_ref_name(module, product_type_ref),
                             name.deref(),
                             table_method_name(accessor_name),
@@ -1674,7 +1722,8 @@ type QueryBuilder = __sdk::QueryBuilder;
 "
             );
             out.delimited_block(
-                "fn register_tables(client_cache: &mut __sdk::ClientCache<Self>) {",
+                "__sdk::__if_client_cache! {
+fn register_tables(client_cache: &mut __sdk::ClientCache<Self>) {",
                 |out| {
                     for (_, accessor_name, _) in iter_table_names_and_types(module, visibility) {
                         writeln!(
@@ -1684,7 +1733,8 @@ type QueryBuilder = __sdk::QueryBuilder;
                         );
                     }
                 },
-                "}\n",
+                "}
+}\n",
             );
             out.delimited_block(
                 "const ALL_TABLE_NAMES: &'static [&'static str] = &[",

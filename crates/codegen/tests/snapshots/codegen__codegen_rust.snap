@@ -1,6 +1,5 @@
 ---
 source: crates/codegen/tests/codegen.rs
-assertion_line: 37
 expression: outfiles
 ---
 "add_player_reducer.rs" = '''
@@ -843,6 +842,7 @@ impl LoggedOutPlayerTableAccess for super::RemoteTables {
     }
 }
 
+pub struct LoggedOutPlayerInitialCallbackId(__sdk::CallbackId);
 pub struct LoggedOutPlayerInsertCallbackId(__sdk::CallbackId);
 pub struct LoggedOutPlayerDeleteCallbackId(__sdk::CallbackId);
 
@@ -850,16 +850,44 @@ impl<'ctx> __sdk::TableLike for LoggedOutPlayerTableHandle<'ctx> {
     type Row = Player;
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 { self.imp.count() }
-    fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+    __sdk::__if_client_cache! {
+        fn count(&self) -> u64 { self.imp.count() }
+        fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+    }
+}
+
+impl<'ctx> LoggedOutPlayerTableHandle<'ctx> {
+    /// Override row reference counting and hook deduplication for this table.
+    ///
+    /// This takes precedence over [`__sdk::DbConnectionBuilder::with_row_deduplication`].
+    /// This has no effect when the SDK is built without `client-cache`, where row events are
+    /// always delivered without reference counting.
+    pub fn set_row_deduplication(&self, deduplicate_rows: bool) {
+        self.imp.set_row_deduplication(deduplicate_rows)
+    }
+
+    /// Register a callback for each initial table batch delivered by `SubscribeApplied`.
+    pub fn on_initial(
+        &self,
+        callback: impl FnMut(&super::EventContext, &[Player]) + Send + 'static,
+    ) -> LoggedOutPlayerInitialCallbackId {
+        LoggedOutPlayerInitialCallbackId(self.imp.on_initial(callback))
+    }
+
+    /// Cancel a callback previously registered by [`Self::on_initial`].
+    pub fn remove_on_initial(&self, callback: LoggedOutPlayerInitialCallbackId) {
+        self.imp.remove_on_initial(callback.0)
+    }
 }
 
 impl<'ctx> __sdk::Table for LoggedOutPlayerTableHandle<'ctx> {
     type Row = Player;
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 { self.imp.count() }
-    fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+    __sdk::__if_client_cache! {
+        fn count(&self) -> u64 { self.imp.count() }
+        fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+    }
 
     type InsertCallbackId = LoggedOutPlayerInsertCallbackId;
 
@@ -950,6 +978,7 @@ impl<'ctx> __sdk::WithUpdate for LoggedOutPlayerTableHandle<'ctx> {
     }
 }
 
+        __sdk::__if_client_cache! {
         /// Access to the `identity` unique index on the table `logged_out_player`,
         /// which allows point queries on the field of the same name
         /// via the [`LoggedOutPlayerIdentityUnique::find`] method.
@@ -979,7 +1008,9 @@ impl<'ctx> __sdk::WithUpdate for LoggedOutPlayerTableHandle<'ctx> {
                 self.imp.find(col_val)
             }
         }
+        }
         
+        __sdk::__if_client_cache! {
         /// Access to the `player_id` unique index on the table `logged_out_player`,
         /// which allows point queries on the field of the same name
         /// via the [`LoggedOutPlayerPlayerIdUnique::find`] method.
@@ -1009,7 +1040,9 @@ impl<'ctx> __sdk::WithUpdate for LoggedOutPlayerTableHandle<'ctx> {
                 self.imp.find(col_val)
             }
         }
+        }
         
+        __sdk::__if_client_cache! {
         /// Access to the `name` unique index on the table `logged_out_player`,
         /// which allows point queries on the field of the same name
         /// via the [`LoggedOutPlayerNameUnique::find`] method.
@@ -1039,7 +1072,9 @@ impl<'ctx> __sdk::WithUpdate for LoggedOutPlayerTableHandle<'ctx> {
                 self.imp.find(col_val)
             }
         }
+        }
         
+__sdk::__if_client_cache! {
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
 
@@ -1047,6 +1082,7 @@ pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::Remote
     _table.add_unique_constraint::<__sdk::Identity>("identity", |row| &row.identity);
     _table.add_unique_constraint::<u64>("player_id", |row| &row.player_id);
     _table.add_unique_constraint::<String>("name", |row| &row.name);
+}
 }
 
 #[doc(hidden)]
@@ -1343,18 +1379,28 @@ impl __sdk::InModule for DbUpdate {
 }
 
 impl __sdk::DbUpdate for DbUpdate {
-    fn apply_to_client_cache(&self, cache: &mut __sdk::ClientCache<RemoteModule>) -> AppliedDiff<'_> {
-                    let mut diff = AppliedDiff::default();
-                
-                diff.logged_out_player = cache.apply_diff_to_table::<Player>("logged_out_player", &self.logged_out_player).with_updates_by_pk(|row| &row.identity);
-        diff.person = cache.apply_diff_to_table::<Person>("person", &self.person).with_updates_by_pk(|row| &row.id);
-        diff.player = cache.apply_diff_to_table::<Player>("player", &self.player).with_updates_by_pk(|row| &row.identity);
-        diff.test_d = cache.apply_diff_to_table::<TestD>("test_d", &self.test_d);
-        diff.test_f = cache.apply_diff_to_table::<TestFoobar>("test_f", &self.test_f);
-        diff.my_player = cache.apply_diff_to_table::<Player>("my_player", &self.my_player);
+        fn apply_to_client_cache(&self, cache: &mut __sdk::ClientCache<RemoteModule>) -> AppliedDiff<'_> {
+        self.apply_to_client_cache_with_row_deduplication(cache, true)
+    }
 
-                    diff
-                }
+fn apply_to_client_cache_with_row_deduplication(&self, cache: &mut __sdk::ClientCache<RemoteModule>, deduplicate_rows: bool) -> AppliedDiff<'_> {
+                let mut diff = AppliedDiff::default();
+        diff.logged_out_player = cache.apply_diff_to_table_with_pk_and_deduplication::<Player, _>("logged_out_player", &self.logged_out_player, |row| &row.identity, deduplicate_rows).with_updates_by_pk(|row| &row.identity);
+        diff.person = cache.apply_diff_to_table_with_pk_and_deduplication::<Person, _>("person", &self.person, |row| &row.id, deduplicate_rows).with_updates_by_pk(|row| &row.id);
+        diff.player = cache.apply_diff_to_table_with_pk_and_deduplication::<Player, _>("player", &self.player, |row| &row.identity, deduplicate_rows).with_updates_by_pk(|row| &row.identity);
+        diff.test_d = cache.apply_diff_to_table_with_deduplication::<TestD>("test_d", &self.test_d, deduplicate_rows);
+        diff.test_f = cache.apply_diff_to_table_with_deduplication::<TestFoobar>("test_f", &self.test_f, deduplicate_rows);
+        diff.my_player = cache.apply_diff_to_table_with_deduplication::<Player>("my_player", &self.my_player, deduplicate_rows);
+diff
+}
+fn mark_initial(&mut self) {
+                self.logged_out_player.mark_initial();
+        self.my_player.mark_initial();
+        self.person.mark_initial();
+        self.player.mark_initial();
+        self.test_d.mark_initial();
+        self.test_f.mark_initial();
+}
 fn parse_initial_rows(raw: __ws::v2::QueryRows) -> __sdk::Result<Self> {
                 let mut db_update = DbUpdate::default();
 for table_rows in raw.tables {
@@ -1403,12 +1449,12 @@ impl __sdk::InModule for AppliedDiff<'_> {
 
 impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
     fn invoke_row_callbacks(&self, event: &EventContext, callbacks: &mut __sdk::DbCallbacks<RemoteModule>) {
-                callbacks.invoke_table_row_callbacks::<Player>("logged_out_player", &self.logged_out_player, event);
-        callbacks.invoke_table_row_callbacks::<Player>("my_player", &self.my_player, event);
-        callbacks.invoke_table_row_callbacks::<Person>("person", &self.person, event);
-        callbacks.invoke_table_row_callbacks::<Player>("player", &self.player, event);
-        callbacks.invoke_table_row_callbacks::<TestD>("test_d", &self.test_d, event);
-        callbacks.invoke_table_row_callbacks::<TestFoobar>("test_f", &self.test_f, event);
+                if callbacks.has_callbacks("logged_out_player") { callbacks.invoke_table_row_callbacks::<Player>("logged_out_player", &self.logged_out_player, event); }
+        if callbacks.has_callbacks("my_player") { callbacks.invoke_table_row_callbacks::<Player>("my_player", &self.my_player, event); }
+        if callbacks.has_callbacks("person") { callbacks.invoke_table_row_callbacks::<Person>("person", &self.person, event); }
+        if callbacks.has_callbacks("player") { callbacks.invoke_table_row_callbacks::<Player>("player", &self.player, event); }
+        if callbacks.has_callbacks("test_d") { callbacks.invoke_table_row_callbacks::<TestD>("test_d", &self.test_d, event); }
+        if callbacks.has_callbacks("test_f") { callbacks.invoke_table_row_callbacks::<TestFoobar>("test_f", &self.test_f, event); }
 }
 }
 
@@ -2059,6 +2105,7 @@ impl __sdk::SpacetimeModule for RemoteModule {
     type SubscriptionHandle = SubscriptionHandle;
     type QueryBuilder = __sdk::QueryBuilder;
 
+__sdk::__if_client_cache! {
 fn register_tables(client_cache: &mut __sdk::ClientCache<Self>) {
                 logged_out_player_table::register_table(client_cache);
         my_player_table::register_table(client_cache);
@@ -2066,6 +2113,7 @@ fn register_tables(client_cache: &mut __sdk::ClientCache<Self>) {
         player_table::register_table(client_cache);
         test_d_table::register_table(client_cache);
         test_f_table::register_table(client_cache);
+}
 }
 const ALL_TABLE_NAMES: &'static [&'static str] = &[
                 "logged_out_player",
@@ -2134,6 +2182,7 @@ impl MyPlayerTableAccess for super::RemoteTables {
     }
 }
 
+pub struct MyPlayerInitialCallbackId(__sdk::CallbackId);
 pub struct MyPlayerInsertCallbackId(__sdk::CallbackId);
 pub struct MyPlayerDeleteCallbackId(__sdk::CallbackId);
 
@@ -2141,16 +2190,44 @@ impl<'ctx> __sdk::TableLike for MyPlayerTableHandle<'ctx> {
     type Row = Player;
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 { self.imp.count() }
-    fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+    __sdk::__if_client_cache! {
+        fn count(&self) -> u64 { self.imp.count() }
+        fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+    }
+}
+
+impl<'ctx> MyPlayerTableHandle<'ctx> {
+    /// Override row reference counting and hook deduplication for this table.
+    ///
+    /// This takes precedence over [`__sdk::DbConnectionBuilder::with_row_deduplication`].
+    /// This has no effect when the SDK is built without `client-cache`, where row events are
+    /// always delivered without reference counting.
+    pub fn set_row_deduplication(&self, deduplicate_rows: bool) {
+        self.imp.set_row_deduplication(deduplicate_rows)
+    }
+
+    /// Register a callback for each initial table batch delivered by `SubscribeApplied`.
+    pub fn on_initial(
+        &self,
+        callback: impl FnMut(&super::EventContext, &[Player]) + Send + 'static,
+    ) -> MyPlayerInitialCallbackId {
+        MyPlayerInitialCallbackId(self.imp.on_initial(callback))
+    }
+
+    /// Cancel a callback previously registered by [`Self::on_initial`].
+    pub fn remove_on_initial(&self, callback: MyPlayerInitialCallbackId) {
+        self.imp.remove_on_initial(callback.0)
+    }
 }
 
 impl<'ctx> __sdk::Table for MyPlayerTableHandle<'ctx> {
     type Row = Player;
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 { self.imp.count() }
-    fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+    __sdk::__if_client_cache! {
+        fn count(&self) -> u64 { self.imp.count() }
+        fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+    }
 
     type InsertCallbackId = MyPlayerInsertCallbackId;
 
@@ -2209,10 +2286,12 @@ impl<'ctx> __sdk::WithDelete for MyPlayerTableHandle<'ctx> {
     }
 }
 
+__sdk::__if_client_cache! {
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
 
         let _table = client_cache.get_or_make_table::<Player>("my_player");
+}
 }
 
 #[doc(hidden)]
@@ -2429,6 +2508,7 @@ impl PersonTableAccess for super::RemoteTables {
     }
 }
 
+pub struct PersonInitialCallbackId(__sdk::CallbackId);
 pub struct PersonInsertCallbackId(__sdk::CallbackId);
 pub struct PersonDeleteCallbackId(__sdk::CallbackId);
 
@@ -2436,16 +2516,44 @@ impl<'ctx> __sdk::TableLike for PersonTableHandle<'ctx> {
     type Row = Person;
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 { self.imp.count() }
-    fn iter(&self) -> impl Iterator<Item = Person> + '_ { self.imp.iter() }
+    __sdk::__if_client_cache! {
+        fn count(&self) -> u64 { self.imp.count() }
+        fn iter(&self) -> impl Iterator<Item = Person> + '_ { self.imp.iter() }
+    }
+}
+
+impl<'ctx> PersonTableHandle<'ctx> {
+    /// Override row reference counting and hook deduplication for this table.
+    ///
+    /// This takes precedence over [`__sdk::DbConnectionBuilder::with_row_deduplication`].
+    /// This has no effect when the SDK is built without `client-cache`, where row events are
+    /// always delivered without reference counting.
+    pub fn set_row_deduplication(&self, deduplicate_rows: bool) {
+        self.imp.set_row_deduplication(deduplicate_rows)
+    }
+
+    /// Register a callback for each initial table batch delivered by `SubscribeApplied`.
+    pub fn on_initial(
+        &self,
+        callback: impl FnMut(&super::EventContext, &[Person]) + Send + 'static,
+    ) -> PersonInitialCallbackId {
+        PersonInitialCallbackId(self.imp.on_initial(callback))
+    }
+
+    /// Cancel a callback previously registered by [`Self::on_initial`].
+    pub fn remove_on_initial(&self, callback: PersonInitialCallbackId) {
+        self.imp.remove_on_initial(callback.0)
+    }
 }
 
 impl<'ctx> __sdk::Table for PersonTableHandle<'ctx> {
     type Row = Person;
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 { self.imp.count() }
-    fn iter(&self) -> impl Iterator<Item = Person> + '_ { self.imp.iter() }
+    __sdk::__if_client_cache! {
+        fn count(&self) -> u64 { self.imp.count() }
+        fn iter(&self) -> impl Iterator<Item = Person> + '_ { self.imp.iter() }
+    }
 
     type InsertCallbackId = PersonInsertCallbackId;
 
@@ -2536,6 +2644,7 @@ impl<'ctx> __sdk::WithUpdate for PersonTableHandle<'ctx> {
     }
 }
 
+        __sdk::__if_client_cache! {
         /// Access to the `id` unique index on the table `person`,
         /// which allows point queries on the field of the same name
         /// via the [`PersonIdUnique::find`] method.
@@ -2565,12 +2674,15 @@ impl<'ctx> __sdk::WithUpdate for PersonTableHandle<'ctx> {
                 self.imp.find(col_val)
             }
         }
+        }
         
+__sdk::__if_client_cache! {
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
 
     let _table = client_cache.get_or_make_table::<Person>("person");
     _table.add_unique_constraint::<u32>("id", |row| &row.id);
+}
 }
 
 #[doc(hidden)]
@@ -2796,6 +2908,7 @@ impl PlayerTableAccess for super::RemoteTables {
     }
 }
 
+pub struct PlayerInitialCallbackId(__sdk::CallbackId);
 pub struct PlayerInsertCallbackId(__sdk::CallbackId);
 pub struct PlayerDeleteCallbackId(__sdk::CallbackId);
 
@@ -2803,16 +2916,44 @@ impl<'ctx> __sdk::TableLike for PlayerTableHandle<'ctx> {
     type Row = Player;
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 { self.imp.count() }
-    fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+    __sdk::__if_client_cache! {
+        fn count(&self) -> u64 { self.imp.count() }
+        fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+    }
+}
+
+impl<'ctx> PlayerTableHandle<'ctx> {
+    /// Override row reference counting and hook deduplication for this table.
+    ///
+    /// This takes precedence over [`__sdk::DbConnectionBuilder::with_row_deduplication`].
+    /// This has no effect when the SDK is built without `client-cache`, where row events are
+    /// always delivered without reference counting.
+    pub fn set_row_deduplication(&self, deduplicate_rows: bool) {
+        self.imp.set_row_deduplication(deduplicate_rows)
+    }
+
+    /// Register a callback for each initial table batch delivered by `SubscribeApplied`.
+    pub fn on_initial(
+        &self,
+        callback: impl FnMut(&super::EventContext, &[Player]) + Send + 'static,
+    ) -> PlayerInitialCallbackId {
+        PlayerInitialCallbackId(self.imp.on_initial(callback))
+    }
+
+    /// Cancel a callback previously registered by [`Self::on_initial`].
+    pub fn remove_on_initial(&self, callback: PlayerInitialCallbackId) {
+        self.imp.remove_on_initial(callback.0)
+    }
 }
 
 impl<'ctx> __sdk::Table for PlayerTableHandle<'ctx> {
     type Row = Player;
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 { self.imp.count() }
-    fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+    __sdk::__if_client_cache! {
+        fn count(&self) -> u64 { self.imp.count() }
+        fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+    }
 
     type InsertCallbackId = PlayerInsertCallbackId;
 
@@ -2903,6 +3044,7 @@ impl<'ctx> __sdk::WithUpdate for PlayerTableHandle<'ctx> {
     }
 }
 
+        __sdk::__if_client_cache! {
         /// Access to the `identity` unique index on the table `player`,
         /// which allows point queries on the field of the same name
         /// via the [`PlayerIdentityUnique::find`] method.
@@ -2932,7 +3074,9 @@ impl<'ctx> __sdk::WithUpdate for PlayerTableHandle<'ctx> {
                 self.imp.find(col_val)
             }
         }
+        }
         
+        __sdk::__if_client_cache! {
         /// Access to the `player_id` unique index on the table `player`,
         /// which allows point queries on the field of the same name
         /// via the [`PlayerPlayerIdUnique::find`] method.
@@ -2962,7 +3106,9 @@ impl<'ctx> __sdk::WithUpdate for PlayerTableHandle<'ctx> {
                 self.imp.find(col_val)
             }
         }
+        }
         
+        __sdk::__if_client_cache! {
         /// Access to the `name` unique index on the table `player`,
         /// which allows point queries on the field of the same name
         /// via the [`PlayerNameUnique::find`] method.
@@ -2992,7 +3138,9 @@ impl<'ctx> __sdk::WithUpdate for PlayerTableHandle<'ctx> {
                 self.imp.find(col_val)
             }
         }
+        }
         
+__sdk::__if_client_cache! {
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
 
@@ -3000,6 +3148,7 @@ pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::Remote
     _table.add_unique_constraint::<__sdk::Identity>("identity", |row| &row.identity);
     _table.add_unique_constraint::<u64>("player_id", |row| &row.player_id);
     _table.add_unique_constraint::<String>("name", |row| &row.name);
+}
 }
 
 #[doc(hidden)]
@@ -3831,6 +3980,7 @@ impl TestDTableAccess for super::RemoteTables {
     }
 }
 
+pub struct TestDInitialCallbackId(__sdk::CallbackId);
 pub struct TestDInsertCallbackId(__sdk::CallbackId);
 pub struct TestDDeleteCallbackId(__sdk::CallbackId);
 
@@ -3838,16 +3988,44 @@ impl<'ctx> __sdk::TableLike for TestDTableHandle<'ctx> {
     type Row = TestD;
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 { self.imp.count() }
-    fn iter(&self) -> impl Iterator<Item = TestD> + '_ { self.imp.iter() }
+    __sdk::__if_client_cache! {
+        fn count(&self) -> u64 { self.imp.count() }
+        fn iter(&self) -> impl Iterator<Item = TestD> + '_ { self.imp.iter() }
+    }
+}
+
+impl<'ctx> TestDTableHandle<'ctx> {
+    /// Override row reference counting and hook deduplication for this table.
+    ///
+    /// This takes precedence over [`__sdk::DbConnectionBuilder::with_row_deduplication`].
+    /// This has no effect when the SDK is built without `client-cache`, where row events are
+    /// always delivered without reference counting.
+    pub fn set_row_deduplication(&self, deduplicate_rows: bool) {
+        self.imp.set_row_deduplication(deduplicate_rows)
+    }
+
+    /// Register a callback for each initial table batch delivered by `SubscribeApplied`.
+    pub fn on_initial(
+        &self,
+        callback: impl FnMut(&super::EventContext, &[TestD]) + Send + 'static,
+    ) -> TestDInitialCallbackId {
+        TestDInitialCallbackId(self.imp.on_initial(callback))
+    }
+
+    /// Cancel a callback previously registered by [`Self::on_initial`].
+    pub fn remove_on_initial(&self, callback: TestDInitialCallbackId) {
+        self.imp.remove_on_initial(callback.0)
+    }
 }
 
 impl<'ctx> __sdk::Table for TestDTableHandle<'ctx> {
     type Row = TestD;
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 { self.imp.count() }
-    fn iter(&self) -> impl Iterator<Item = TestD> + '_ { self.imp.iter() }
+    __sdk::__if_client_cache! {
+        fn count(&self) -> u64 { self.imp.count() }
+        fn iter(&self) -> impl Iterator<Item = TestD> + '_ { self.imp.iter() }
+    }
 
     type InsertCallbackId = TestDInsertCallbackId;
 
@@ -3906,10 +4084,12 @@ impl<'ctx> __sdk::WithDelete for TestDTableHandle<'ctx> {
     }
 }
 
+__sdk::__if_client_cache! {
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
 
         let _table = client_cache.get_or_make_table::<TestD>("test_d");
+}
 }
 
 #[doc(hidden)]
@@ -4130,6 +4310,7 @@ impl TestFTableAccess for super::RemoteTables {
     }
 }
 
+pub struct TestFInitialCallbackId(__sdk::CallbackId);
 pub struct TestFInsertCallbackId(__sdk::CallbackId);
 pub struct TestFDeleteCallbackId(__sdk::CallbackId);
 
@@ -4137,16 +4318,44 @@ impl<'ctx> __sdk::TableLike for TestFTableHandle<'ctx> {
     type Row = TestFoobar;
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 { self.imp.count() }
-    fn iter(&self) -> impl Iterator<Item = TestFoobar> + '_ { self.imp.iter() }
+    __sdk::__if_client_cache! {
+        fn count(&self) -> u64 { self.imp.count() }
+        fn iter(&self) -> impl Iterator<Item = TestFoobar> + '_ { self.imp.iter() }
+    }
+}
+
+impl<'ctx> TestFTableHandle<'ctx> {
+    /// Override row reference counting and hook deduplication for this table.
+    ///
+    /// This takes precedence over [`__sdk::DbConnectionBuilder::with_row_deduplication`].
+    /// This has no effect when the SDK is built without `client-cache`, where row events are
+    /// always delivered without reference counting.
+    pub fn set_row_deduplication(&self, deduplicate_rows: bool) {
+        self.imp.set_row_deduplication(deduplicate_rows)
+    }
+
+    /// Register a callback for each initial table batch delivered by `SubscribeApplied`.
+    pub fn on_initial(
+        &self,
+        callback: impl FnMut(&super::EventContext, &[TestFoobar]) + Send + 'static,
+    ) -> TestFInitialCallbackId {
+        TestFInitialCallbackId(self.imp.on_initial(callback))
+    }
+
+    /// Cancel a callback previously registered by [`Self::on_initial`].
+    pub fn remove_on_initial(&self, callback: TestFInitialCallbackId) {
+        self.imp.remove_on_initial(callback.0)
+    }
 }
 
 impl<'ctx> __sdk::Table for TestFTableHandle<'ctx> {
     type Row = TestFoobar;
     type EventContext = super::EventContext;
 
-    fn count(&self) -> u64 { self.imp.count() }
-    fn iter(&self) -> impl Iterator<Item = TestFoobar> + '_ { self.imp.iter() }
+    __sdk::__if_client_cache! {
+        fn count(&self) -> u64 { self.imp.count() }
+        fn iter(&self) -> impl Iterator<Item = TestFoobar> + '_ { self.imp.iter() }
+    }
 
     type InsertCallbackId = TestFInsertCallbackId;
 
@@ -4205,10 +4414,12 @@ impl<'ctx> __sdk::WithDelete for TestFTableHandle<'ctx> {
     }
 }
 
+__sdk::__if_client_cache! {
 #[doc(hidden)]
 pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
 
         let _table = client_cache.get_or_make_table::<TestFoobar>("test_f");
+}
 }
 
 #[doc(hidden)]

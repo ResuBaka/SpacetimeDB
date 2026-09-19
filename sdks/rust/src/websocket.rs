@@ -25,15 +25,12 @@ use std::time::Duration;
 use thiserror::Error;
 #[cfg(not(feature = "browser"))]
 use tokio::{net::TcpStream, runtime, task::JoinHandle, time::Instant};
-#[cfg(not(feature = "browser"))]
-use tokio_tungstenite::{
-    connect_async_with_config,
-    tungstenite::client::IntoClientRequest,
-    tungstenite::protocol::{Message as WebSocketMessage, WebSocketConfig},
-    MaybeTlsStream, WebSocketStream,
-};
 #[cfg(feature = "browser")]
 use tokio_tungstenite_wasm::{Message as WebSocketMessage, WebSocketStream};
+#[cfg(not(feature = "browser"))]
+use tokio_websockets::{
+    ClientBuilder, Connector, Limits, MaybeTlsStream, Message as WebSocketMessage, WebSocketStream,
+};
 
 use crate::compression::decompress_server_message;
 #[cfg(not(feature = "browser"))]
@@ -41,9 +38,9 @@ use crate::db_connection::debug_log;
 use crate::metrics::CLIENT_METRICS;
 
 #[cfg(not(feature = "browser"))]
-type TokioTungsteniteError = tokio_tungstenite::tungstenite::Error;
+type WebSocketError = tokio_websockets::Error;
 #[cfg(feature = "browser")]
-type TokioTungsteniteError = tokio_tungstenite_wasm::Error;
+type WebSocketError = tokio_tungstenite_wasm::Error;
 
 #[derive(Error, Debug, Clone)]
 pub enum UriError {
@@ -72,11 +69,11 @@ pub enum WsError {
     UriError(#[from] UriError),
 
     #[error("Error in WebSocket connection with {uri}: {source}")]
-    Tungstenite {
+    WebSocket {
         uri: Uri,
         #[source]
-        // `Arc` is required for `Self: Clone`, as `tungstenite::Error: !Clone`.
-        source: Arc<TokioTungsteniteError>,
+        // `Arc` is required for `Self: Clone`, as WebSocket errors are not cloneable.
+        source: Arc<WebSocketError>,
     },
 
     #[error("Received empty raw message, but valid messages always start with a one-byte compression flag")]
@@ -216,49 +213,6 @@ fn make_uri_impl(
     })
 }
 
-// Tungstenite doesn't offer an interface to specify a WebSocket protocol, which frankly
-// seems like a pretty glaring omission in its API. In order to insert our own protocol
-// header, we manually the `Request` constructed by
-// `tungstenite::IntoClientRequest::into_client_request`.
-
-// TODO: `core` uses [Hyper](https://docs.rs/hyper/latest/hyper/) as its HTTP library
-//       rather than having Tungstenite manage its own connections. Should this library do
-//       the same?
-
-#[cfg(not(feature = "browser"))]
-fn make_request(
-    host: Uri,
-    db_name: &str,
-    token: Option<&str>,
-    connection_id: Option<ConnectionId>,
-    params: WsParams,
-) -> Result<http::Request<()>, WsError> {
-    let uri = make_uri(host, db_name, connection_id, params)?;
-    let mut req = IntoClientRequest::into_client_request(uri.clone()).map_err(|source| WsError::Tungstenite {
-        uri,
-        source: Arc::new(source),
-    })?;
-    request_insert_protocol_header(&mut req);
-    request_insert_auth_header(&mut req, token);
-    Ok(req)
-}
-
-#[cfg(not(feature = "browser"))]
-fn request_insert_protocol_header(req: &mut http::Request<()>) {
-    req.headers_mut().insert(
-        http::header::SEC_WEBSOCKET_PROTOCOL,
-        const { http::HeaderValue::from_static(ws::v2::BIN_PROTOCOL) },
-    );
-}
-
-#[cfg(not(feature = "browser"))]
-fn request_insert_auth_header(req: &mut http::Request<()>, token: Option<&str>) {
-    if let Some(token) = token {
-        let auth = ["Bearer ", token].concat().try_into().unwrap();
-        req.headers_mut().insert(http::header::AUTHORIZATION, auth);
-    }
-}
-
 #[cfg(feature = "browser")]
 async fn fetch_ws_token(host: &Uri, auth_token: &str) -> Result<String, WsError> {
     use gloo_net::http::{Method, RequestBuilder};
@@ -305,7 +259,6 @@ async fn fetch_ws_token(host: &Uri, auth_token: &str) -> Result<String, WsError>
         .as_string()
         .ok_or_else(|| WsError::TokenVerification("`token` parsing failed".into()))
 }
-
 /// If `res` evaluates to `Err(e)`, log a warning in the form `"{}: {:?}", $cause, e`.
 ///
 /// Could be trivially written as a function, but macro-ifying it preserves the source location of the log.
@@ -329,24 +282,67 @@ impl WsConnection {
         connection_id: Option<ConnectionId>,
         params: WsParams,
     ) -> Result<Self, WsError> {
-        let req = make_request(host, db_name, token, connection_id, params)?;
+        let uri = make_uri(host, db_name, connection_id, params)?;
+        // TODO(kim): In order to be able to replicate module WASM blobs,
+        // `cloud-next` cannot have message / frame size limits. That's
+        // obviously a bad default for all other clients, though.
+        let mut builder = ClientBuilder::from_uri(uri.clone()).limits(Limits::unlimited());
+        builder = builder
+            .add_header(
+                http::header::SEC_WEBSOCKET_PROTOCOL,
+                const { http::HeaderValue::from_static(ws::v2::BIN_PROTOCOL) },
+            )
+            .map_err(|source| WsError::WebSocket {
+                uri: uri.clone(),
+                source: Arc::new(source),
+            })?;
+        if let Some(token) = token {
+            let auth = ["Bearer ", token].concat().try_into().unwrap();
+            builder = builder
+                .add_header(http::header::AUTHORIZATION, auth)
+                .map_err(|source| WsError::WebSocket {
+                    uri: uri.clone(),
+                    source: Arc::new(source),
+                })?;
+        }
 
-        // Grab the URI for error-reporting.
-        let uri = req.uri().clone();
-
-        let (sock, _): (WebSocketStream<MaybeTlsStream<TcpStream>>, _) = connect_async_with_config(
-            req,
-            // TODO(kim): In order to be able to replicate module WASM blobs,
-            // `cloud-next` cannot have message / frame size limits. That's
-            // obviously a bad default for all other clients, though.
-            Some(WebSocketConfig::default().max_frame_size(None).max_message_size(None)),
-            false,
-        )
-        .await
-        .map_err(|source| WsError::Tungstenite {
-            uri,
-            source: Arc::new(source),
+        // ClientBuilder's default resolver selects only the first DNS result.
+        // Connect through Tokio so hosts with both IPv4 and IPv6 addresses retain
+        // the SDK's previous fallback behavior.
+        let host = uri.host().ok_or_else(|| WsError::WebSocket {
+            uri: uri.clone(),
+            source: Arc::new(tokio_websockets::Error::CannotResolveHost),
         })?;
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let port = uri
+            .port_u16()
+            .unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
+        let stream = TcpStream::connect((host, port))
+            .await
+            .map_err(|source| WsError::WebSocket {
+                uri: uri.clone(),
+                source: Arc::new(source.into()),
+            })?;
+        let connector = if uri.scheme_str() == Some("wss") {
+            Connector::new().map_err(|source| WsError::WebSocket {
+                uri: uri.clone(),
+                source: Arc::new(source),
+            })?
+        } else {
+            Connector::Plain
+        };
+        let stream = connector
+            .wrap(host, stream)
+            .await
+            .map_err(|source| WsError::WebSocket {
+                uri: uri.clone(),
+                source: Arc::new(source),
+            })?;
+        let (sock, _): (WebSocketStream<MaybeTlsStream<TcpStream>>, _) =
+            builder.connect_on(stream).await.map_err(|source| WsError::WebSocket {
+                uri,
+                source: Arc::new(source),
+            })?;
         Ok(WsConnection {
             db_name: db_name.into(),
             sock,
@@ -370,7 +366,7 @@ impl WsConnection {
         let uri = make_uri(host, db_name, connection_id, params, token.as_deref())?;
         let sock = tokio_tungstenite_wasm::connect_with_protocols(&uri.to_string(), &[ws::v2::BIN_PROTOCOL])
             .await
-            .map_err(|source| WsError::Tungstenite {
+            .map_err(|source| WsError::WebSocket {
                 uri,
                 source: Arc::new(source),
             })?;
@@ -386,8 +382,14 @@ impl WsConnection {
         bsatn::from_slice(bytes).map_err(|source| WsError::DeserializeMessage { source })
     }
 
+    #[cfg(feature = "browser")]
     pub(crate) fn encode_message(msg: ws::v2::ClientMessage) -> WebSocketMessage {
         WebSocketMessage::Binary(bsatn::to_vec(&msg).unwrap().into())
+    }
+
+    #[cfg(not(feature = "browser"))]
+    pub(crate) fn encode_message(msg: ws::v2::ClientMessage) -> WebSocketMessage {
+        WebSocketMessage::binary(bsatn::to_vec(&msg).unwrap())
     }
 
     #[cfg(not(feature = "browser"))]
@@ -442,7 +444,7 @@ impl WsConnection {
         loop {
             tokio::select! {
                 incoming = self.sock.try_next() => match incoming {
-                    Err(tokio_tungstenite::tungstenite::error::Error::ConnectionClosed) | Ok(None) => {
+                    Ok(None) => {
                         log::info!("Connection closed");
                         break;
                     },
@@ -456,7 +458,8 @@ impl WsConnection {
                         break;
                     },
 
-                    Ok(Some(WebSocketMessage::Binary(bytes))) => {
+                    Ok(Some(message)) if message.is_binary() => {
+                        let bytes = message.into_payload();
                         idle = false;
                         record_metrics(bytes.len());
                         match Self::parse_response(&bytes) {
@@ -473,27 +476,26 @@ impl WsConnection {
                         }
                     }
 
-                    Ok(Some(WebSocketMessage::Ping(payload))) => {
+                    Ok(Some(message)) if message.is_ping() => {
                         log::trace!("received ping");
                         idle = false;
-                        record_metrics(payload.len());
+                        record_metrics(message.as_payload().len());
                         // No need to explicitly respond with a `Pong`,
-                        // as tungstenite handles this automatically.
-                        // See [https://github.com/snapview/tokio-tungstenite/issues/88].
+                        // as tokio-websockets handles this automatically.
                     },
 
-                    Ok(Some(WebSocketMessage::Pong(payload))) => {
+                    Ok(Some(message)) if message.is_pong() => {
                         log::trace!("received pong");
                         idle = false;
                         want_pong = false;
-                        record_metrics(payload.len());
+                        record_metrics(message.as_payload().len());
                     },
 
                     Ok(Some(other)) => {
                         debug_log(&extra_logging, |file| writeln!(file, "Unexpeccted WebSocket message {other:?}"));
                         log::warn!("Unexpected WebSocket message {other:?}");
                         idle = false;
-                        record_metrics(other.len());
+                        record_metrics(other.as_payload().len());
                     },
                 },
 
@@ -507,7 +509,7 @@ impl WsConnection {
                         }
 
                         log::trace!("sending client ping");
-                        let ping = WebSocketMessage::Ping(Bytes::new());
+                        let ping = WebSocketMessage::ping(Bytes::new());
                         if let Err(e) = self.sock.send(ping).await {
                             debug_log(&extra_logging, |file| writeln!(file, "Error sending ping: {e:?}"));
                             log::warn!("Error sending ping: {e:?}");

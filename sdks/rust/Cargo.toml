@@ -11,6 +11,9 @@ rust-version.workspace = true
 [features]
 default = ["client-cache"]
 client-cache = ["dep:anymap3"]
+# Preserve raw row bytes for cacheless consumers that inspect WithBsatn::bsatn.
+# The client cache always retains them, regardless of this feature.
+retain-row-bytes = []
 allow_loopback_http_for_tests = ["spacetimedb-testing/allow_loopback_http_for_tests"]
 browser = [
     "dep:getrandom",

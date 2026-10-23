@@ -283,7 +283,23 @@ impl<'ctx> {table_handle}<'ctx> {{
         {initial_callback_id}(self.imp.on_initial(callback))
     }}
 
-    /// Cancel a callback previously registered by [`Self::on_initial`].
+    /// Register a borrowed initial-row view without cloning the full snapshot.
+    pub fn on_initial_rows(
+        &self,
+        callback: impl FnMut(&super::EventContext, __sdk::InitialRows<'_, {row_type}>) + Send + 'static,
+    ) -> {initial_callback_id} {{
+        {initial_callback_id}(self.imp.on_initial_rows(callback))
+    }}
+
+    /// Receive owned initial rows; cacheless single-listener dispatch moves payloads.
+    pub fn on_initial_owned(
+        &self,
+        callback: impl FnMut(&super::EventContext, Vec<{row_type}>) + Send + 'static,
+    ) -> {initial_callback_id} {{
+        {initial_callback_id}(self.imp.on_initial_owned(callback))
+    }}
+
+    /// Cancel a callback registered by any initial-row registration method.
     pub fn remove_on_initial(&self, callback: {initial_callback_id}) {{
         self.imp.remove_on_initial(callback.0)
     }}
@@ -1569,6 +1585,15 @@ impl __sdk::InModule for DbUpdate {{
                 },
                 "}\n",
             );
+            out.delimited_block(
+                "fn invoke_owned_initial_callbacks(&mut self, event: &EventContext, callbacks: &mut __sdk::DbCallbacks<RemoteModule>) {",
+                |out| {
+                    for (name, accessor_name, _) in iter_table_names_and_types(module, visibility) {
+                        writeln!(out, "callbacks.invoke_owned_initial_callbacks({:?}, &mut self.{}, event);", name.deref(), table_method_name(accessor_name));
+                    }
+                },
+                "}\n",
+            );
 
             out.delimited_block(
                 "fn parse_initial_rows(raw: __ws::v2::QueryRows) -> __sdk::Result<Self> {",
@@ -1790,6 +1815,49 @@ pub struct RemoteTables {{
 
 impl __sdk::InModule for RemoteTables {{
     type Module = RemoteModule;
+}}
+
+impl RemoteTables {{
+    /// Receive owned initial rows by table name. Row must match the table type.
+    pub fn on_initial_owned<Row>(
+        &self,
+        table: &'static str,
+        callback: impl FnMut(&EventContext, Vec<Row>) + Send + 'static,
+    ) -> __sdk::CallbackId
+    where
+        Row: __sdk::InModule<Module = RemoteModule> + Clone + std::fmt::Debug + Send + Sync + 'static,
+    {{
+        self.imp.get_table::<Row>(table).on_initial_owned(callback)
+    }}
+
+    pub fn remove_on_initial_owned<Row>(&self, table: &'static str, callback: __sdk::CallbackId)
+    where
+        Row: __sdk::InModule<Module = RemoteModule> + Clone + std::fmt::Debug + Send + Sync + 'static,
+    {{
+        self.imp.get_table::<Row>(table).remove_on_initial(callback)
+    }}
+
+    /// Register a borrowed initial-row callback by table name. `Row` must be the
+    /// row type of that table. This avoids regenerating individual table handles
+    /// when migrating an existing client to borrowed snapshots.
+    pub fn on_initial_rows<Row>(
+        &self,
+        table: &'static str,
+        callback: impl FnMut(&EventContext, __sdk::InitialRows<'_, Row>) + Send + 'static,
+    ) -> __sdk::CallbackId
+    where
+        Row: __sdk::InModule<Module = RemoteModule> + Clone + std::fmt::Debug + Send + Sync + 'static,
+    {{
+        self.imp.get_table::<Row>(table).on_initial_rows(callback)
+    }}
+
+    /// Cancel a callback returned by `on_initial_rows` for the same table/type.
+    pub fn remove_on_initial_rows<Row>(&self, table: &'static str, callback: __sdk::CallbackId)
+    where
+        Row: __sdk::InModule<Module = RemoteModule> + Clone + std::fmt::Debug + Send + Sync + 'static,
+    {{
+        self.imp.get_table::<Row>(table).remove_on_initial(callback)
+    }}
 }}
 
 /// A connection to a remote module, including a materialized view of a subset of the database.

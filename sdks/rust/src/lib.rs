@@ -49,6 +49,7 @@ pub use spacetime_module::SubscriptionHandle;
 pub use spacetimedb_client_api_messages::websocket::v1::Compression;
 pub use spacetimedb_lib::{ConnectionId, Identity, ScheduleAt, TimeDuration, Timestamp, Uuid};
 pub use spacetimedb_sats::{i256, u256};
+pub use table::InitialRows;
 
 #[doc(hidden)]
 pub mod __codegen {
@@ -77,7 +78,7 @@ pub mod __codegen {
         SubscriptionEventContext, SubscriptionHandle, TableUpdate,
     };
     pub use crate::subscription::{OnEndedCallback, SubscriptionBuilder, SubscriptionHandleImpl};
-    pub use crate::table::{TableLike, WithDelete, WithInsert, WithUpdate};
+    pub use crate::table::{InitialRows, TableLike, WithDelete, WithInsert, WithUpdate};
     pub use crate::{
         ConnectionId, DbConnectionBuilder, DbContext, Event, EventTable, Identity, ReducerEvent, ScheduleAt, Table,
         TableAccessor, TableWithPrimaryKey, TimeDuration, Timestamp, Uuid,

@@ -107,6 +107,15 @@ where
     /// Mark table updates represented in this message as initial subscription batches.
     fn mark_initial(&mut self) {}
 
+    /// Dispatch owned initial rows after the applied diff and its borrows have
+    /// been dropped. Requires bindings generated with owned-initial support.
+    fn invoke_owned_initial_callbacks(
+        &mut self,
+        _event: &<Self::Module as SpacetimeModule>::EventContext,
+        _callbacks: &mut DbCallbacks<Self::Module>,
+    ) {
+    }
+
     fn parse_update(update: ws::v2::TransactionUpdate) -> crate::Result<Self> {
         Self::try_from(update).map_err(|source| {
             InternalError::failed_parse(std::any::type_name::<Self>(), "TransactionUpdate")
@@ -234,6 +243,8 @@ where
 
 #[derive(Debug)]
 pub struct WithBsatn<Row> {
+    /// Serialized row bytes, retained with `client-cache` or `retain-row-bytes`.
+    /// Empty in the default cacheless parsing path; `row` is fully owned.
     pub bsatn: Bytes,
     pub row: Row,
 }
@@ -258,10 +269,23 @@ impl<Row> Default for TableUpdate<Row> {
 }
 
 impl<Row> TableUpdate<Row> {
-    pub fn append(&mut self, mut other: TableUpdate<Row>) {
-        self.inserts.append(&mut other.inserts);
-        self.deletes.append(&mut other.deletes);
+    pub fn append(&mut self, other: TableUpdate<Row>) {
+        Self::append_rows(&mut self.inserts, other.inserts);
+        Self::append_rows(&mut self.deletes, other.deletes);
         self.present = true;
+    }
+
+    fn append_rows(target: &mut Vec<WithBsatn<Row>>, mut source: Vec<WithBsatn<Row>>) {
+        // Generated parsers append a freshly parsed table into a default update.
+        // Vec::append would allocate a second backing array and move every row.
+        // Adopt the first nonempty vector instead, independently for each side.
+        if target.is_empty() && !source.is_empty() {
+            *target = source;
+        } else {
+            // Preserve order for subsequent chunks, and keep reserved capacity
+            // when the incoming side is empty.
+            target.append(&mut source);
+        }
     }
 
     pub fn mark_initial(&mut self) {
@@ -319,6 +343,15 @@ impl<Row: DeserializeOwned + Debug> TableUpdate<Row> {
         let parsed = bsatn::from_slice::<Row>(&bytes).map_err(|source| {
             InternalError::failed_parse(std::any::type_name::<Row>(), "row data").with_cause(source)
         })?;
+        // DeserializeOwned guarantees the decoded row cannot borrow the input.
+        // In cacheless mode neither callback delivery nor PK update matching
+        // needs BSATN. Keeping these slices would pin whole packed row buffers
+        // until the typed update (and any SDK queue holding it) is dropped.
+        #[cfg(not(any(feature = "client-cache", feature = "retain-row-bytes")))]
+        let bytes = {
+            drop(bytes);
+            Bytes::new()
+        };
         Ok(WithBsatn {
             bsatn: bytes,
             row: parsed,
@@ -359,4 +392,264 @@ pub fn transaction_update_iter_table_updates(
 ) -> impl Iterator<Item = ws::v2::TableUpdate> {
     Box::<[_]>::into_iter(tx_update.query_sets)
         .flat_map(|query_set_update| Box::<[_]>::into_iter(query_set_update.tables))
+}
+
+#[cfg(test)]
+mod table_update_append_tests {
+    use super::*;
+    use spacetimedb_client_api_messages::websocket::common::RowSizeHint;
+
+    fn raw_rows(values: &[u32]) -> BsatnRowList {
+        let bytes = values
+            .iter()
+            .flat_map(|value| bsatn::to_vec(value).unwrap())
+            .collect::<Vec<_>>();
+        BsatnRowList::new(RowSizeHint::FixedSize(4), Bytes::from(bytes))
+    }
+
+    fn values(rows: &[WithBsatn<u32>]) -> Vec<u32> {
+        rows.iter().map(|row| row.row).collect()
+    }
+
+    #[test]
+    fn initial_parse_append_adopts_the_parsed_insert_allocation() {
+        let parsed = parse_row_list_as_inserts::<u32>(raw_rows(&[10, 20, 30])).unwrap();
+        let allocation = parsed.inserts.as_ptr();
+        let capacity = parsed.inserts.capacity();
+        let serialized = parsed.inserts[0].bsatn.as_ptr();
+        let mut combined = TableUpdate::default();
+        combined.append(parsed);
+        assert_eq!(combined.inserts.as_ptr(), allocation);
+        assert_eq!(combined.inserts.capacity(), capacity);
+        assert_eq!(combined.inserts[0].bsatn.as_ptr(), serialized);
+        assert_eq!(values(&combined.inserts), [10, 20, 30]);
+        assert!(combined.deletes.is_empty());
+        assert!(!combined.is_initial());
+        combined.mark_initial();
+        assert!(combined.is_initial());
+    }
+
+    #[test]
+    fn unsubscribe_parse_append_adopts_the_parsed_delete_allocation() {
+        let parsed = parse_row_list_as_deletes::<u32>(raw_rows(&[10, 20])).unwrap();
+        let allocation = parsed.deletes.as_ptr();
+        let capacity = parsed.deletes.capacity();
+        let mut combined = TableUpdate::default();
+        combined.append(parsed);
+        assert_eq!(combined.deletes.as_ptr(), allocation);
+        assert_eq!(combined.deletes.capacity(), capacity);
+        assert_eq!(values(&combined.deletes), [10, 20]);
+        assert!(combined.inserts.is_empty());
+    }
+
+    #[test]
+    fn repeated_appends_preserve_both_row_orders_and_initial_flag_semantics() {
+        let mut combined = TableUpdate::default();
+        combined.mark_initial();
+        assert!(!combined.is_initial()); // table absent from message
+        combined.append(parse_row_list_as_inserts::<u32>(raw_rows(&[1, 2])).unwrap());
+        combined.append(parse_row_list_as_deletes::<u32>(raw_rows(&[10])).unwrap());
+        let mut next = parse_row_list_as_inserts::<u32>(raw_rows(&[3, 4])).unwrap();
+        next.deletes = parse_row_list_as_deletes::<u32>(raw_rows(&[20, 30])).unwrap().deletes;
+        next.mark_initial();
+        combined.append(next);
+        assert!(!combined.is_initial()); // append does not import other's flag
+        combined.mark_initial();
+        combined.append(TableUpdate::default());
+        assert!(combined.is_initial()); // append does not clear our flag
+        assert_eq!(values(&combined.inserts), [1, 2, 3, 4]);
+        assert_eq!(values(&combined.deletes), [10, 20, 30]);
+    }
+
+    #[test]
+    fn empty_sides_keep_capacity_and_empty_snapshots_still_mark_present() {
+        let mut combined = TableUpdate::<u32>::default();
+        combined.inserts.reserve(16);
+        combined.deletes.reserve(16);
+        let inserts = (combined.inserts.as_ptr(), combined.inserts.capacity());
+        let deletes = (combined.deletes.as_ptr(), combined.deletes.capacity());
+        combined.append(parse_row_list_as_inserts::<u32>(raw_rows(&[])).unwrap());
+        assert_eq!((combined.inserts.as_ptr(), combined.inserts.capacity()), inserts);
+        assert_eq!((combined.deletes.as_ptr(), combined.deletes.capacity()), deletes);
+        combined.mark_initial();
+        assert!(combined.is_initial());
+        assert!(combined.is_empty());
+        let incoming = parse_row_list_as_inserts::<u32>(raw_rows(&[1])).unwrap();
+        let allocation = incoming.inserts.as_ptr();
+        combined.append(incoming);
+        assert_eq!(combined.inserts.as_ptr(), allocation); // adopt even if empty destination reserved
+        assert_eq!((combined.deletes.as_ptr(), combined.deletes.capacity()), deletes);
+    }
+
+    #[test]
+    fn append_moves_nonclone_rows_without_dropping_payloads_early() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct Row(Arc<AtomicUsize>);
+        impl Drop for Row {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut combined = TableUpdate::default();
+        for _ in 0..2 {
+            let mut update = TableUpdate::default();
+            update.inserts.push(WithBsatn {
+                bsatn: Bytes::new(),
+                row: Row(Arc::clone(&drops)),
+            });
+            update.deletes.push(WithBsatn {
+                bsatn: Bytes::new(),
+                row: Row(Arc::clone(&drops)),
+            });
+            combined.append(update);
+        }
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(combined);
+        assert_eq!(drops.load(Ordering::Relaxed), 4);
+    }
+}
+
+#[cfg(test)]
+mod row_byte_retention_tests {
+    use super::*;
+    use spacetimedb_client_api_messages::websocket::common::RowSizeHint;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct OwnedBytes {
+        data: Vec<u8>,
+        drops: Arc<AtomicUsize>,
+    }
+    impl AsRef<[u8]> for OwnedBytes {
+        fn as_ref(&self) -> &[u8] {
+            &self.data
+        }
+    }
+    impl Drop for OwnedBytes {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn tracked_rows(values: &[u32], drops: &Arc<AtomicUsize>) -> BsatnRowList {
+        let data = values
+            .iter()
+            .flat_map(|value| bsatn::to_vec(value).unwrap())
+            .collect::<Vec<_>>();
+        let bytes = Bytes::from_owner(OwnedBytes {
+            data,
+            drops: Arc::clone(drops),
+        });
+        BsatnRowList::new(RowSizeHint::FixedSize(4), bytes)
+    }
+
+    fn check_policy(rows: &[WithBsatn<u32>], drops: &AtomicUsize) {
+        if cfg!(any(feature = "client-cache", feature = "retain-row-bytes")) {
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+            for row in rows {
+                assert_eq!(bsatn::from_slice::<u32>(&row.bsatn).unwrap(), row.row);
+            }
+        } else {
+            // The packed backing allocation was actually dropped, not merely
+            // hidden from the callback or copied into a different buffer.
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+            assert!(rows.iter().all(|row| row.bsatn.is_empty()));
+        }
+    }
+
+    #[test]
+    fn parsed_initial_rows_release_backing_bytes_in_cacheless_mode() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut parsed = parse_row_list_as_inserts::<u32>(tracked_rows(&[10, 20, 30], &drops)).unwrap();
+        parsed.mark_initial();
+        assert!(parsed.is_initial());
+        check_policy(&parsed.inserts, &drops);
+        let borrowed = crate::InitialRows::new(&parsed.inserts);
+        assert_eq!(borrowed.iter().copied().collect::<Vec<_>>(), [10, 20, 30]);
+        drop(parsed);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn parsed_delete_rows_follow_the_same_retention_policy() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let parsed = parse_row_list_as_deletes::<u32>(tracked_rows(&[10, 20], &drops)).unwrap();
+        check_policy(&parsed.deletes, &drops);
+        assert_eq!(parsed.deletes.iter().map(|row| row.row).collect::<Vec<_>>(), [10, 20]);
+        drop(parsed);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn persistent_and_event_parsing_preserve_values_without_pinning_bytes() {
+        let inserts = Arc::new(AtomicUsize::new(0));
+        let deletes = Arc::new(AtomicUsize::new(0));
+        let parsed = TableUpdate::<u32>::parse_table_update(ws::v2::TableUpdate {
+            table_name: "test".into(),
+            rows: vec![ws::v2::TableUpdateRows::PersistentTable(ws::v2::PersistentTableRows {
+                inserts: tracked_rows(&[10], &inserts),
+                deletes: tracked_rows(&[20], &deletes),
+            })]
+            .into_boxed_slice(),
+        })
+        .unwrap();
+        check_policy(&parsed.inserts, &inserts);
+        check_policy(&parsed.deletes, &deletes);
+        drop(parsed);
+        assert_eq!(inserts.load(Ordering::Relaxed), 1);
+        assert_eq!(deletes.load(Ordering::Relaxed), 1);
+
+        let events = Arc::new(AtomicUsize::new(0));
+        let parsed = TableUpdate::<u32>::parse_table_update(ws::v2::TableUpdate {
+            table_name: "test".into(),
+            rows: vec![ws::v2::TableUpdateRows::EventTable(ws::v2::EventTableRows {
+                events: tracked_rows(&[30, 40], &events),
+            })]
+            .into_boxed_slice(),
+        })
+        .unwrap();
+        check_policy(&parsed.inserts, &events);
+        let applied = parsed.into_event_diff();
+        assert_eq!(applied.inserts().copied().collect::<Vec<_>>(), [30, 40]);
+        drop(parsed);
+        assert_eq!(events.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn decode_errors_release_input_bytes_in_all_modes() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let bytes = Bytes::from_owner(OwnedBytes {
+            data: vec![1, 2],
+            drops: Arc::clone(&drops),
+        });
+        assert!(TableUpdate::<u32>::parse_row(bytes).is_err());
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn decoded_strings_and_vectors_remain_owned_after_input_release() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let value = ("inventory payload".repeat(32), vec![1u32, 2, 3, 4]);
+        let bytes = Bytes::from_owner(OwnedBytes {
+            data: bsatn::to_vec(&value).unwrap(),
+            drops: Arc::clone(&drops),
+        });
+        let parsed = TableUpdate::<(String, Vec<u32>)>::parse_row(bytes).unwrap();
+        assert_eq!(parsed.row, value);
+        if cfg!(any(feature = "client-cache", feature = "retain-row-bytes")) {
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+            assert!(!parsed.bsatn.is_empty());
+        } else {
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+            assert!(parsed.bsatn.is_empty());
+        }
+        drop(parsed);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
 }

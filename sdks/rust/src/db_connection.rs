@@ -300,7 +300,7 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
 
     fn apply_update(
         &self,
-        update: M::DbUpdate,
+        mut update: M::DbUpdate,
         get_event: impl FnOnce(&mut DbContextImplInner<M>) -> Event<M::Reducer>,
     ) {
         // Lock the client cache in a restricted scope,
@@ -314,6 +314,10 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
         let event = get_event(&mut inner);
         let row_event_ctx = self.make_event_ctx(event);
         applied_diff.invoke_row_callbacks(&row_event_ctx, &mut inner.db_callbacks);
+        // The diff borrows decoded rows. Only move them after every borrowed
+        // listener has returned and those borrows are gone.
+        drop(applied_diff);
+        update.invoke_owned_initial_callbacks(&row_event_ctx, &mut inner.db_callbacks);
     }
 
     /// Mark the connection lifecycle as ended, route the terminal event to the

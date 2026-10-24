@@ -1457,17 +1457,63 @@ fn print_db_update_defn(module: &ModuleDef, visibility: CodegenVisibility, out: 
     out.delimited_block(
         "pub struct DbUpdate {",
         |out| {
-            for (_, accessor_name, product_type_ref) in iter_table_names_and_types(module, visibility) {
-                writeln!(
-                    out,
-                    "{}: __sdk::TableUpdate<{}>,",
-                    table_method_name(accessor_name),
-                    type_ref_name(module, product_type_ref),
-                );
-            }
+            writeln!(out, "tables: Vec<__DbTableUpdate>,");
         },
         "}\n",
     );
+
+    // Keep payloads inline in a sparse vector: no per-table boxes, and no empty
+    // TableUpdate construction/destruction for tables absent from the message.
+    writeln!(
+        out,
+        "#[derive(Debug)]\n#[allow(non_camel_case_types)]\nenum __DbTableUpdate {{"
+    );
+    for (_, accessor_name, product_type_ref) in iter_table_names_and_types(module, visibility) {
+        writeln!(
+            out,
+            "{}(__sdk::TableUpdate<{}>),",
+            table_method_name(accessor_name),
+            type_ref_name(module, product_type_ref)
+        );
+    }
+    writeln!(
+        out,
+        "__Unused,\n}}\nimpl __DbTableUpdate {{\nfn order(&self) -> usize {{ match self {{"
+    );
+    // Match the old cache-application order (tables, then views), independently
+    // of callback order (all accessor names sorted together).
+    for (index, accessor) in iter_tables(module, visibility)
+        .map(|t| &t.accessor_name)
+        .chain(iter_views(module).map(|v| &v.accessor_name))
+        .enumerate()
+    {
+        writeln!(out, "Self::{}(_) => {index},", table_method_name(accessor));
+    }
+    writeln!(
+        out,
+        "Self::__Unused => unreachable!(),\n}} }}\nfn callback_order(&self) -> usize {{ match self {{"
+    );
+    for (index, (_, accessor_name, _)) in iter_table_names_and_types(module, visibility).enumerate() {
+        writeln!(out, "Self::{}(_) => {index},", table_method_name(accessor_name));
+    }
+    writeln!(
+        out,
+        "Self::__Unused => unreachable!(),\n}} }}\nfn append(&mut self, other: Self) {{ match (self, other) {{"
+    );
+    for (_, accessor_name, _) in iter_table_names_and_types(module, visibility) {
+        let field = table_method_name(accessor_name);
+        writeln!(
+            out,
+            "(Self::{field}(current), Self::{field}(other)) => current.append(other),"
+        );
+    }
+    writeln!(
+        out,
+        "_ => unreachable!(\"table update variant mismatch\"),\n}} }}\n}}\nimpl DbUpdate {{"
+    );
+    let table_count = iter_table_names_and_types(module, visibility).count();
+    writeln!(out, "fn with_table_capacity(hint: usize) -> Self {{ Self {{ tables: Vec::with_capacity(hint.min({table_count})) }} }}\nfn append(&mut self, update: __DbTableUpdate) {{");
+    writeln!(out, "match self.tables.binary_search_by_key(&update.order(), __DbTableUpdate::order) {{\nOk(index) => self.tables[index].append(update),\nErr(index) => self.tables.insert(index, update),\n}}\n}}\n}}");
 
     out.newline();
 
@@ -1476,7 +1522,7 @@ fn print_db_update_defn(module: &ModuleDef, visibility: CodegenVisibility, out: 
 impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
     type Error = __sdk::Error;
     fn try_from(raw: __ws::v2::TransactionUpdate) -> Result<Self, Self::Error> {
-        let mut db_update = DbUpdate::default();
+        let mut db_update = DbUpdate::with_table_capacity(raw.query_sets.iter().map(|set| set.tables.len()).sum());
         for table_update in __sdk::transaction_update_iter_table_updates(raw) {
             match &table_update.table_name[..] {
 ",
@@ -1484,7 +1530,7 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
             for (name, accessor_name, _) in iter_table_names_and_types(module, visibility) {
                 writeln!(
                     out,
-                    "{:?} => db_update.{}.append({}::parse_table_update(table_update)?),",
+                    "{:?} => db_update.append(__DbTableUpdate::{}({}::parse_table_update(table_update)?)),",
                     name.deref(),
                     table_method_name(accessor_name),
                     table_module_name(accessor_name),
@@ -1527,70 +1573,80 @@ impl __sdk::InModule for DbUpdate {{
             out.delimited_block(
                 "fn apply_to_client_cache_with_row_deduplication(&self, cache: &mut __sdk::ClientCache<RemoteModule>, deduplicate_rows: bool) -> AppliedDiff<'_> {",
                 |out| {
-                    writeln!(out, "let mut diff = AppliedDiff::default();");
+                    writeln!(out, "let mut diff = AppliedDiff {{ tables: Vec::with_capacity(self.tables.len()) }};");
+                    writeln!(out, "for update in &self.tables {{ match update {{");
                     for table in iter_tables(module, visibility) {
                         let field_name = table_method_name(&table.accessor_name);
+                        out.delimited_block(&format!("__DbTableUpdate::{field_name}(update) => {{ if update.has_changes() {{"), |out| {
                         if table.is_event {
                             // Event tables bypass the client cache entirely.
                             // We construct an applied diff directly from the inserts,
                             // which will fire on_insert callbacks without storing rows.
                             writeln!(
                                 out,
-                                "diff.{field_name} = self.{field_name}.into_event_diff();",
+                                "diff.tables.push(__AppliedTableDiff::{field_name}(update.into_event_diff()));",
                             );
                         } else if let Some(col) = table.primary_key {
                             let row_type = type_ref_name(module, table.product_type_ref);
                             let pk_field = table.get_column(col).unwrap().accessor_name.deref().to_case(Case::Snake);
                             writeln!(
                                 out,
-                                "diff.{field_name} = cache.apply_diff_to_table_with_pk_and_deduplication::<{row_type}, _>({:?}, &self.{field_name}, |row| &row.{pk_field}, deduplicate_rows).with_updates_by_pk(|row| &row.{pk_field});",
+                                "diff.tables.push(__AppliedTableDiff::{field_name}(cache.apply_diff_to_table_with_pk_and_deduplication::<{row_type}, _>({:?}, update, |row| &row.{pk_field}, deduplicate_rows).with_updates_by_pk(|row| &row.{pk_field})));",
                                 table.name.deref(),
                             );
                         } else {
                             writeln!(
                                 out,
-                                "diff.{field_name} = cache.apply_diff_to_table_with_deduplication::<{}>({:?}, &self.{field_name}, deduplicate_rows);",
+                                "diff.tables.push(__AppliedTableDiff::{field_name}(cache.apply_diff_to_table_with_deduplication::<{}>({:?}, update, deduplicate_rows)));",
                                 type_ref_name(module, table.product_type_ref),
                                 table.name.deref(),
                             );
                         }
+                        }, "} }\n");
                     }
                     for view in iter_views(module) {
                         let field_name = table_method_name(&view.accessor_name);
                         let row_type = type_ref_name(module, view.product_type_ref);
+                        out.delimited_block(&format!("__DbTableUpdate::{field_name}(update) => {{ if update.has_changes() {{"), |out| {
                         if let Some(col) = view.primary_key {
                             let pk_field = view.return_columns[col.idx()].accessor_name.deref().to_case(Case::Snake);
                             writeln!(
                                 out,
-                                "diff.{field_name} = cache.apply_diff_to_table_with_pk_and_deduplication::<{row_type}, _>({:?}, &self.{field_name}, |row| &row.{pk_field}, deduplicate_rows).with_updates_by_pk(|row| &row.{pk_field});",
+                                "diff.tables.push(__AppliedTableDiff::{field_name}(cache.apply_diff_to_table_with_pk_and_deduplication::<{row_type}, _>({:?}, update, |row| &row.{pk_field}, deduplicate_rows).with_updates_by_pk(|row| &row.{pk_field})));",
                                 view.name.deref(),
                             );
                         } else {
                             writeln!(
                                 out,
-                                "diff.{field_name} = cache.apply_diff_to_table_with_deduplication::<{row_type}>({:?}, &self.{field_name}, deduplicate_rows);",
+                                "diff.tables.push(__AppliedTableDiff::{field_name}(cache.apply_diff_to_table_with_deduplication::<{row_type}>({:?}, update, deduplicate_rows)));",
                                 view.name.deref(),
                             );
                         }
+                        }, "} }\n");
                     }
+                    writeln!(out, "__DbTableUpdate::__Unused => unreachable!(),\n}} }}\ndiff.tables.sort_unstable_by_key(__AppliedTableDiff::callback_order);");
                 },
                 "diff\n}\n",
             );
             out.delimited_block(
                 "fn mark_initial(&mut self) {",
                 |out| {
+                    writeln!(out, "for table in &mut self.tables {{ match table {{");
                     for (_, accessor_name, _) in iter_table_names_and_types(module, visibility) {
-                        writeln!(out, "self.{}.mark_initial();", table_method_name(accessor_name));
+                        writeln!(out, "__DbTableUpdate::{}(update) => update.mark_initial(),", table_method_name(accessor_name));
                     }
+                    writeln!(out, "__DbTableUpdate::__Unused => unreachable!(),\n}} }}");
                 },
                 "}\n",
             );
             out.delimited_block(
                 "fn invoke_owned_initial_callbacks(&mut self, event: &EventContext, callbacks: &mut __sdk::DbCallbacks<RemoteModule>) {",
                 |out| {
+                    writeln!(out, "self.tables.sort_unstable_by_key(__DbTableUpdate::callback_order);\nfor table in &mut self.tables {{ match table {{");
                     for (name, accessor_name, _) in iter_table_names_and_types(module, visibility) {
-                        writeln!(out, "callbacks.invoke_owned_initial_callbacks({:?}, &mut self.{}, event);", name.deref(), table_method_name(accessor_name));
+                        writeln!(out, "__DbTableUpdate::{}(update) => callbacks.invoke_owned_initial_callbacks({:?}, update, event),", table_method_name(accessor_name), name.deref());
                     }
+                    writeln!(out, "__DbTableUpdate::__Unused => unreachable!(),\n}} }}\nself.tables.sort_unstable_by_key(__DbTableUpdate::order);");
                 },
                 "}\n",
             );
@@ -1598,7 +1654,7 @@ impl __sdk::InModule for DbUpdate {{
             out.delimited_block(
                 "fn parse_initial_rows(raw: __ws::v2::QueryRows) -> __sdk::Result<Self> {",
                 |out| {
-                    writeln!(out, "let mut db_update = DbUpdate::default();");
+                    writeln!(out, "let mut db_update = DbUpdate::with_table_capacity(raw.tables.len());");
                     out.delimited_block(
                         "for table_rows in raw.tables {",
                         |out| {
@@ -1608,7 +1664,7 @@ impl __sdk::InModule for DbUpdate {{
                                     for (name, accessor_name, _) in iter_table_names_and_types(module, visibility) {
                                         writeln!(
                                             out,
-                                            "{:?} => db_update.{}.append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),",
+                                            "{:?} => db_update.append(__DbTableUpdate::{}(__sdk::parse_row_list_as_inserts(table_rows.rows)?)),",
                                             name.deref(),
                                             table_method_name(accessor_name),
                                         );
@@ -1631,7 +1687,7 @@ impl __sdk::InModule for DbUpdate {{
             out.delimited_block(
                 "fn parse_unsubscribe_rows(raw: __ws::v2::QueryRows) -> __sdk::Result<Self> {",
                 |out| {
-                    writeln!(out, "let mut db_update = DbUpdate::default();");
+                    writeln!(out, "let mut db_update = DbUpdate::with_table_capacity(raw.tables.len());");
                     out.delimited_block(
                         "for table_rows in raw.tables {",
                         |out| {
@@ -1641,7 +1697,7 @@ impl __sdk::InModule for DbUpdate {{
                                     for (name, accessor_name, _) in iter_table_names_and_types(module, visibility) {
                                         writeln!(
                                             out,
-                                            "{:?} => db_update.{}.append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),",
+                                            "{:?} => db_update.append(__DbTableUpdate::{}(__sdk::parse_row_list_as_deletes(table_rows.rows)?)),",
                                             name.deref(),
                                             table_method_name(accessor_name),
                                         );
@@ -1672,21 +1728,26 @@ fn print_applied_diff_defn(module: &ModuleDef, visibility: CodegenVisibility, ou
     out.delimited_block(
         "pub struct AppliedDiff<'r> {",
         |out| {
-            for (_, accessor_name, product_type_ref) in iter_table_names_and_types(module, visibility) {
-                writeln!(
-                    out,
-                    "{}: __sdk::TableAppliedDiff<'r, {}>,",
-                    table_method_name(accessor_name),
-                    type_ref_name(module, product_type_ref),
-                );
-            }
-            // Also write a `PhantomData` field which uses the lifetime `r`,
-            // in case the module defines zero tables,
-            // as unused lifetime params are an error.
-            writeln!(out, "__unused: std::marker::PhantomData<&'r ()>,",);
+            writeln!(out, "tables: Vec<__AppliedTableDiff<'r>>,");
         },
         "}\n",
     );
+
+    writeln!(out, "#[allow(non_camel_case_types)]\nenum __AppliedTableDiff<'r> {{");
+    for (_, accessor_name, product_type_ref) in iter_table_names_and_types(module, visibility) {
+        writeln!(
+            out,
+            "{}(__sdk::TableAppliedDiff<'r, {}>),",
+            table_method_name(accessor_name),
+            type_ref_name(module, product_type_ref)
+        );
+    }
+    // The lifetime must remain used even for modules without tables or views.
+    writeln!(out, "__Unused(std::marker::PhantomData<&'r ()>),\n}}\nimpl __AppliedTableDiff<'_> {{\nfn callback_order(&self) -> usize {{ match self {{");
+    for (index, (_, accessor_name, _)) in iter_table_names_and_types(module, visibility).enumerate() {
+        writeln!(out, "Self::{}(_) => {index},", table_method_name(accessor_name));
+    }
+    writeln!(out, "Self::__Unused(_) => unreachable!(),\n}} }}\n}}");
 
     out.newline();
 
@@ -1705,16 +1766,18 @@ impl __sdk::InModule for AppliedDiff<'_> {{
             out.delimited_block(
                 "fn invoke_row_callbacks(&self, event: &EventContext, callbacks: &mut __sdk::DbCallbacks<RemoteModule>) {",
                 |out| {
+                    writeln!(out, "for table in &self.tables {{ match table {{");
                     for (name, accessor_name, product_type_ref) in iter_table_names_and_types(module, visibility) {
                         writeln!(
                             out,
-                            "if callbacks.has_callbacks({:?}) {{ callbacks.invoke_table_row_callbacks::<{}>({:?}, &self.{}, event); }}",
+                            "__AppliedTableDiff::{}(diff) => {{ if diff.has_changes() && callbacks.has_callbacks({:?}) {{ callbacks.invoke_table_row_callbacks::<{}>({:?}, diff, event); }} }},",
+                            table_method_name(accessor_name),
                             name.deref(),
                             type_ref_name(module, product_type_ref),
                             name.deref(),
-                            table_method_name(accessor_name),
                         );
                     }
+                    writeln!(out, "__AppliedTableDiff::__Unused(_) => unreachable!(),\n}} }}");
                 },
                 "}\n",
             );

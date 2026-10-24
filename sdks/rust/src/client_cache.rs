@@ -185,6 +185,13 @@ impl<Row> Default for TableAppliedDiff<'_, Row> {
 }
 
 impl<'r, Row> TableAppliedDiff<'r, Row> {
+    /// Whether callback dispatch has row events or an initial snapshot to deliver.
+    /// An empty initial snapshot is not an untouched table.
+    #[inline]
+    pub fn has_changes(&self) -> bool {
+        self.initial_rows.is_some() || !self.is_empty()
+    }
+
     /// For event tables: construct a `TableAppliedDiff` with just inserts,
     /// without touching the client cache.
     /// Each insert will fire `on_insert` callbacks.
@@ -307,6 +314,38 @@ mod applied_diff_tests {
             bsatn: Bytes::new(),
             row: PkRow { id, value },
         }
+    }
+
+    #[test]
+    fn dispatch_guards_preserve_empty_initial_snapshots_and_all_row_events() {
+        let mut update = TableUpdate::<PkRow>::default();
+        assert!(!update.has_changes());
+        assert!(!TableAppliedDiff::from_raw(&update).has_changes());
+        // Marking the overall update initial must not mark absent tables.
+        update.mark_initial();
+        assert!(!update.has_changes());
+        update.append(TableUpdate::default()); // present, but zero rows
+        assert!(!update.has_changes()); // empty live update has no events
+        update.mark_initial();
+        assert!(update.has_changes());
+        let initial = TableAppliedDiff::from_raw(&update);
+        assert!(initial.is_empty());
+        assert!(initial.has_changes());
+        assert!(initial.initial_rows().unwrap().is_empty());
+
+        let mut live = TableUpdate::default();
+        live.inserts.push(row(1, 10));
+        assert!(live.has_changes());
+        assert!(TableAppliedDiff::from_raw(&live).has_changes());
+        assert!(live.into_event_diff().has_changes());
+        live.inserts.clear();
+        live.deletes.push(row(1, 10));
+        assert!(live.has_changes());
+        assert!(TableAppliedDiff::from_raw(&live).has_changes());
+        live.inserts.push(row(1, 20));
+        let applied = TableAppliedDiff::from_raw(&live).with_updates_by_pk(|row| &row.id);
+        assert!(applied.inserts.is_empty() && applied.deletes.is_empty());
+        assert!(applied.has_changes(), "update-only diffs must be dispatched");
     }
 
     #[test]

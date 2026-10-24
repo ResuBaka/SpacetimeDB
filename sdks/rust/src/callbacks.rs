@@ -83,11 +83,11 @@ impl<M: SpacetimeModule> DbCallbacks<M> {
         self.table_callbacks.entry(table_name).or_default()
     }
 
-    /// Invoke all row callbacks for rows modified by `applied_diff` for the table `table_name`.
-    pub fn has_callbacks(&mut self, table_name: &'static str) -> bool {
-        let table_callbacks = self.get_table_callbacks(table_name);
-
-        table_callbacks.has_callbacks.load(Ordering::Relaxed)
+    /// Check registration without creating callback state for an unseen table.
+    pub fn has_callbacks(&self, table_name: &'static str) -> bool {
+        self.table_callbacks
+            .get(table_name)
+            .is_some_and(|callbacks| callbacks.has_callbacks.load(Ordering::Relaxed))
     }
 
     /// Invoke all row callbacks for rows modified by `applied_diff` for the table `table_name`.
@@ -97,7 +97,7 @@ impl<M: SpacetimeModule> DbCallbacks<M> {
         applied_diff: &TableAppliedDiff<Row>,
         event: &M::EventContext,
     ) {
-        if applied_diff.is_empty() && applied_diff.initial_rows().is_none() {
+        if !applied_diff.has_changes() {
             return;
         }
         let table_callbacks = self.get_table_callbacks(table_name);

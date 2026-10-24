@@ -874,7 +874,23 @@ impl<'ctx> LoggedOutPlayerTableHandle<'ctx> {
         LoggedOutPlayerInitialCallbackId(self.imp.on_initial(callback))
     }
 
-    /// Cancel a callback previously registered by [`Self::on_initial`].
+    /// Register a borrowed initial-row view without cloning the full snapshot.
+    pub fn on_initial_rows(
+        &self,
+        callback: impl FnMut(&super::EventContext, __sdk::InitialRows<'_, Player>) + Send + 'static,
+    ) -> LoggedOutPlayerInitialCallbackId {
+        LoggedOutPlayerInitialCallbackId(self.imp.on_initial_rows(callback))
+    }
+
+    /// Receive owned initial rows; cacheless single-listener dispatch moves payloads.
+    pub fn on_initial_owned(
+        &self,
+        callback: impl FnMut(&super::EventContext, Vec<Player>) + Send + 'static,
+    ) -> LoggedOutPlayerInitialCallbackId {
+        LoggedOutPlayerInitialCallbackId(self.imp.on_initial_owned(callback))
+    }
+
+    /// Cancel a callback registered by any initial-row registration method.
     pub fn remove_on_initial(&self, callback: LoggedOutPlayerInitialCallbackId) {
         self.imp.remove_on_initial(callback.0)
     }
@@ -1338,28 +1354,72 @@ _ => unreachable!(),
 #[allow(non_snake_case)]
 #[doc(hidden)]
 pub struct DbUpdate {
-        logged_out_player: __sdk::TableUpdate<Player>,
-    my_player: __sdk::TableUpdate<Player>,
-    person: __sdk::TableUpdate<Person>,
-    player: __sdk::TableUpdate<Player>,
-    test_d: __sdk::TableUpdate<TestD>,
-    test_f: __sdk::TableUpdate<TestFoobar>,
+        tables: Vec<__DbTableUpdate>,
+}
+#[derive(Debug)]
+#[allow(non_camel_case_types)]
+enum __DbTableUpdate {
+logged_out_player(__sdk::TableUpdate<Player>),
+my_player(__sdk::TableUpdate<Player>),
+person(__sdk::TableUpdate<Person>),
+player(__sdk::TableUpdate<Player>),
+test_d(__sdk::TableUpdate<TestD>),
+test_f(__sdk::TableUpdate<TestFoobar>),
+__Unused,
+}
+impl __DbTableUpdate {
+fn order(&self) -> usize { match self {
+Self::logged_out_player(_) => 0,
+Self::person(_) => 1,
+Self::player(_) => 2,
+Self::test_d(_) => 3,
+Self::test_f(_) => 4,
+Self::my_player(_) => 5,
+Self::__Unused => unreachable!(),
+} }
+fn callback_order(&self) -> usize { match self {
+Self::logged_out_player(_) => 0,
+Self::my_player(_) => 1,
+Self::person(_) => 2,
+Self::player(_) => 3,
+Self::test_d(_) => 4,
+Self::test_f(_) => 5,
+Self::__Unused => unreachable!(),
+} }
+fn append(&mut self, other: Self) { match (self, other) {
+(Self::logged_out_player(current), Self::logged_out_player(other)) => current.append(other),
+(Self::my_player(current), Self::my_player(other)) => current.append(other),
+(Self::person(current), Self::person(other)) => current.append(other),
+(Self::player(current), Self::player(other)) => current.append(other),
+(Self::test_d(current), Self::test_d(other)) => current.append(other),
+(Self::test_f(current), Self::test_f(other)) => current.append(other),
+_ => unreachable!("table update variant mismatch"),
+} }
+}
+impl DbUpdate {
+fn with_table_capacity(hint: usize) -> Self { Self { tables: Vec::with_capacity(hint.min(6)) } }
+fn append(&mut self, update: __DbTableUpdate) {
+match self.tables.binary_search_by_key(&update.order(), __DbTableUpdate::order) {
+Ok(index) => self.tables[index].append(update),
+Err(index) => self.tables.insert(index, update),
+}
+}
 }
 
 
 impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
     type Error = __sdk::Error;
     fn try_from(raw: __ws::v2::TransactionUpdate) -> Result<Self, Self::Error> {
-        let mut db_update = DbUpdate::default();
+        let mut db_update = DbUpdate::with_table_capacity(raw.query_sets.iter().map(|set| set.tables.len()).sum());
         for table_update in __sdk::transaction_update_iter_table_updates(raw) {
             match &table_update.table_name[..] {
 
-        "logged_out_player" => db_update.logged_out_player.append(logged_out_player_table::parse_table_update(table_update)?),
-    "my_player" => db_update.my_player.append(my_player_table::parse_table_update(table_update)?),
-    "person" => db_update.person.append(person_table::parse_table_update(table_update)?),
-    "player" => db_update.player.append(player_table::parse_table_update(table_update)?),
-    "test_d" => db_update.test_d.append(test_d_table::parse_table_update(table_update)?),
-    "test_f" => db_update.test_f.append(test_f_table::parse_table_update(table_update)?),
+        "logged_out_player" => db_update.append(__DbTableUpdate::logged_out_player(logged_out_player_table::parse_table_update(table_update)?)),
+    "my_player" => db_update.append(__DbTableUpdate::my_player(my_player_table::parse_table_update(table_update)?)),
+    "person" => db_update.append(__DbTableUpdate::person(person_table::parse_table_update(table_update)?)),
+    "player" => db_update.append(__DbTableUpdate::player(player_table::parse_table_update(table_update)?)),
+    "test_d" => db_update.append(__DbTableUpdate::test_d(test_d_table::parse_table_update(table_update)?)),
+    "test_f" => db_update.append(__DbTableUpdate::test_f(test_f_table::parse_table_update(table_update)?)),
 
                 unknown => {
                     return Err(__sdk::InternalError::unknown_name(
@@ -1384,46 +1444,78 @@ impl __sdk::DbUpdate for DbUpdate {
     }
 
 fn apply_to_client_cache_with_row_deduplication(&self, cache: &mut __sdk::ClientCache<RemoteModule>, deduplicate_rows: bool) -> AppliedDiff<'_> {
-                let mut diff = AppliedDiff::default();
-        diff.logged_out_player = cache.apply_diff_to_table_with_pk_and_deduplication::<Player, _>("logged_out_player", &self.logged_out_player, |row| &row.identity, deduplicate_rows).with_updates_by_pk(|row| &row.identity);
-        diff.person = cache.apply_diff_to_table_with_pk_and_deduplication::<Person, _>("person", &self.person, |row| &row.id, deduplicate_rows).with_updates_by_pk(|row| &row.id);
-        diff.player = cache.apply_diff_to_table_with_pk_and_deduplication::<Player, _>("player", &self.player, |row| &row.identity, deduplicate_rows).with_updates_by_pk(|row| &row.identity);
-        diff.test_d = cache.apply_diff_to_table_with_deduplication::<TestD>("test_d", &self.test_d, deduplicate_rows);
-        diff.test_f = cache.apply_diff_to_table_with_deduplication::<TestFoobar>("test_f", &self.test_f, deduplicate_rows);
-        diff.my_player = cache.apply_diff_to_table_with_deduplication::<Player>("my_player", &self.my_player, deduplicate_rows);
+                let mut diff = AppliedDiff { tables: Vec::with_capacity(self.tables.len()) };
+        for update in &self.tables { match update {
+__DbTableUpdate::logged_out_player(update) => { if update.has_changes() {
+                        diff.tables.push(__AppliedTableDiff::logged_out_player(cache.apply_diff_to_table_with_pk_and_deduplication::<Player, _>("logged_out_player", update, |row| &row.identity, deduplicate_rows).with_updates_by_pk(|row| &row.identity)));
+} }
+__DbTableUpdate::person(update) => { if update.has_changes() {
+                        diff.tables.push(__AppliedTableDiff::person(cache.apply_diff_to_table_with_pk_and_deduplication::<Person, _>("person", update, |row| &row.id, deduplicate_rows).with_updates_by_pk(|row| &row.id)));
+} }
+__DbTableUpdate::player(update) => { if update.has_changes() {
+                        diff.tables.push(__AppliedTableDiff::player(cache.apply_diff_to_table_with_pk_and_deduplication::<Player, _>("player", update, |row| &row.identity, deduplicate_rows).with_updates_by_pk(|row| &row.identity)));
+} }
+__DbTableUpdate::test_d(update) => { if update.has_changes() {
+                        diff.tables.push(__AppliedTableDiff::test_d(cache.apply_diff_to_table_with_deduplication::<TestD>("test_d", update, deduplicate_rows)));
+} }
+__DbTableUpdate::test_f(update) => { if update.has_changes() {
+                        diff.tables.push(__AppliedTableDiff::test_f(cache.apply_diff_to_table_with_deduplication::<TestFoobar>("test_f", update, deduplicate_rows)));
+} }
+__DbTableUpdate::my_player(update) => { if update.has_changes() {
+                        diff.tables.push(__AppliedTableDiff::my_player(cache.apply_diff_to_table_with_deduplication::<Player>("my_player", update, deduplicate_rows)));
+} }
+        __DbTableUpdate::__Unused => unreachable!(),
+        } }
+        diff.tables.sort_unstable_by_key(__AppliedTableDiff::callback_order);
 diff
 }
 fn mark_initial(&mut self) {
-                self.logged_out_player.mark_initial();
-        self.my_player.mark_initial();
-        self.person.mark_initial();
-        self.player.mark_initial();
-        self.test_d.mark_initial();
-        self.test_f.mark_initial();
+                for table in &mut self.tables { match table {
+        __DbTableUpdate::logged_out_player(update) => update.mark_initial(),
+        __DbTableUpdate::my_player(update) => update.mark_initial(),
+        __DbTableUpdate::person(update) => update.mark_initial(),
+        __DbTableUpdate::player(update) => update.mark_initial(),
+        __DbTableUpdate::test_d(update) => update.mark_initial(),
+        __DbTableUpdate::test_f(update) => update.mark_initial(),
+        __DbTableUpdate::__Unused => unreachable!(),
+        } }
+}
+fn invoke_owned_initial_callbacks(&mut self, event: &EventContext, callbacks: &mut __sdk::DbCallbacks<RemoteModule>) {
+                self.tables.sort_unstable_by_key(__DbTableUpdate::callback_order);
+        for table in &mut self.tables { match table {
+        __DbTableUpdate::logged_out_player(update) => callbacks.invoke_owned_initial_callbacks("logged_out_player", update, event),
+        __DbTableUpdate::my_player(update) => callbacks.invoke_owned_initial_callbacks("my_player", update, event),
+        __DbTableUpdate::person(update) => callbacks.invoke_owned_initial_callbacks("person", update, event),
+        __DbTableUpdate::player(update) => callbacks.invoke_owned_initial_callbacks("player", update, event),
+        __DbTableUpdate::test_d(update) => callbacks.invoke_owned_initial_callbacks("test_d", update, event),
+        __DbTableUpdate::test_f(update) => callbacks.invoke_owned_initial_callbacks("test_f", update, event),
+        __DbTableUpdate::__Unused => unreachable!(),
+        } }
+        self.tables.sort_unstable_by_key(__DbTableUpdate::order);
 }
 fn parse_initial_rows(raw: __ws::v2::QueryRows) -> __sdk::Result<Self> {
-                let mut db_update = DbUpdate::default();
+                let mut db_update = DbUpdate::with_table_capacity(raw.tables.len());
 for table_rows in raw.tables {
             match &table_rows.table[..] {
-                                "logged_out_player" => db_update.logged_out_player.append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
-                "my_player" => db_update.my_player.append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
-                "person" => db_update.person.append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
-                "player" => db_update.player.append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
-                "test_d" => db_update.test_d.append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
-                "test_f" => db_update.test_f.append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                                "logged_out_player" => db_update.append(__DbTableUpdate::logged_out_player(__sdk::parse_row_list_as_inserts(table_rows.rows)?)),
+                "my_player" => db_update.append(__DbTableUpdate::my_player(__sdk::parse_row_list_as_inserts(table_rows.rows)?)),
+                "person" => db_update.append(__DbTableUpdate::person(__sdk::parse_row_list_as_inserts(table_rows.rows)?)),
+                "player" => db_update.append(__DbTableUpdate::player(__sdk::parse_row_list_as_inserts(table_rows.rows)?)),
+                "test_d" => db_update.append(__DbTableUpdate::test_d(__sdk::parse_row_list_as_inserts(table_rows.rows)?)),
+                "test_f" => db_update.append(__DbTableUpdate::test_f(__sdk::parse_row_list_as_inserts(table_rows.rows)?)),
                 unknown => { return Err(__sdk::InternalError::unknown_name("table", unknown, "QueryRows").into()); }
 }}        Ok(db_update)
 }
 fn parse_unsubscribe_rows(raw: __ws::v2::QueryRows) -> __sdk::Result<Self> {
-                let mut db_update = DbUpdate::default();
+                let mut db_update = DbUpdate::with_table_capacity(raw.tables.len());
 for table_rows in raw.tables {
             match &table_rows.table[..] {
-                                "logged_out_player" => db_update.logged_out_player.append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
-                "my_player" => db_update.my_player.append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
-                "person" => db_update.person.append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
-                "player" => db_update.player.append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
-                "test_d" => db_update.test_d.append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
-                "test_f" => db_update.test_f.append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                                "logged_out_player" => db_update.append(__DbTableUpdate::logged_out_player(__sdk::parse_row_list_as_deletes(table_rows.rows)?)),
+                "my_player" => db_update.append(__DbTableUpdate::my_player(__sdk::parse_row_list_as_deletes(table_rows.rows)?)),
+                "person" => db_update.append(__DbTableUpdate::person(__sdk::parse_row_list_as_deletes(table_rows.rows)?)),
+                "player" => db_update.append(__DbTableUpdate::player(__sdk::parse_row_list_as_deletes(table_rows.rows)?)),
+                "test_d" => db_update.append(__DbTableUpdate::test_d(__sdk::parse_row_list_as_deletes(table_rows.rows)?)),
+                "test_f" => db_update.append(__DbTableUpdate::test_f(__sdk::parse_row_list_as_deletes(table_rows.rows)?)),
                 unknown => { return Err(__sdk::InternalError::unknown_name("table", unknown, "QueryRows").into()); }
 }}        Ok(db_update)
 }
@@ -1433,13 +1525,28 @@ for table_rows in raw.tables {
 #[allow(non_snake_case)]
 #[doc(hidden)]
 pub struct AppliedDiff<'r> {
-        logged_out_player: __sdk::TableAppliedDiff<'r, Player>,
-    my_player: __sdk::TableAppliedDiff<'r, Player>,
-    person: __sdk::TableAppliedDiff<'r, Person>,
-    player: __sdk::TableAppliedDiff<'r, Player>,
-    test_d: __sdk::TableAppliedDiff<'r, TestD>,
-    test_f: __sdk::TableAppliedDiff<'r, TestFoobar>,
-    __unused: std::marker::PhantomData<&'r ()>,
+        tables: Vec<__AppliedTableDiff<'r>>,
+}
+#[allow(non_camel_case_types)]
+enum __AppliedTableDiff<'r> {
+logged_out_player(__sdk::TableAppliedDiff<'r, Player>),
+my_player(__sdk::TableAppliedDiff<'r, Player>),
+person(__sdk::TableAppliedDiff<'r, Person>),
+player(__sdk::TableAppliedDiff<'r, Player>),
+test_d(__sdk::TableAppliedDiff<'r, TestD>),
+test_f(__sdk::TableAppliedDiff<'r, TestFoobar>),
+__Unused(std::marker::PhantomData<&'r ()>),
+}
+impl __AppliedTableDiff<'_> {
+fn callback_order(&self) -> usize { match self {
+Self::logged_out_player(_) => 0,
+Self::my_player(_) => 1,
+Self::person(_) => 2,
+Self::player(_) => 3,
+Self::test_d(_) => 4,
+Self::test_f(_) => 5,
+Self::__Unused(_) => unreachable!(),
+} }
 }
 
 
@@ -1449,12 +1556,15 @@ impl __sdk::InModule for AppliedDiff<'_> {
 
 impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
     fn invoke_row_callbacks(&self, event: &EventContext, callbacks: &mut __sdk::DbCallbacks<RemoteModule>) {
-                if callbacks.has_callbacks("logged_out_player") { callbacks.invoke_table_row_callbacks::<Player>("logged_out_player", &self.logged_out_player, event); }
-        if callbacks.has_callbacks("my_player") { callbacks.invoke_table_row_callbacks::<Player>("my_player", &self.my_player, event); }
-        if callbacks.has_callbacks("person") { callbacks.invoke_table_row_callbacks::<Person>("person", &self.person, event); }
-        if callbacks.has_callbacks("player") { callbacks.invoke_table_row_callbacks::<Player>("player", &self.player, event); }
-        if callbacks.has_callbacks("test_d") { callbacks.invoke_table_row_callbacks::<TestD>("test_d", &self.test_d, event); }
-        if callbacks.has_callbacks("test_f") { callbacks.invoke_table_row_callbacks::<TestFoobar>("test_f", &self.test_f, event); }
+                for table in &self.tables { match table {
+        __AppliedTableDiff::logged_out_player(diff) => { if diff.has_changes() && callbacks.has_callbacks("logged_out_player") { callbacks.invoke_table_row_callbacks::<Player>("logged_out_player", diff, event); } },
+        __AppliedTableDiff::my_player(diff) => { if diff.has_changes() && callbacks.has_callbacks("my_player") { callbacks.invoke_table_row_callbacks::<Player>("my_player", diff, event); } },
+        __AppliedTableDiff::person(diff) => { if diff.has_changes() && callbacks.has_callbacks("person") { callbacks.invoke_table_row_callbacks::<Person>("person", diff, event); } },
+        __AppliedTableDiff::player(diff) => { if diff.has_changes() && callbacks.has_callbacks("player") { callbacks.invoke_table_row_callbacks::<Player>("player", diff, event); } },
+        __AppliedTableDiff::test_d(diff) => { if diff.has_changes() && callbacks.has_callbacks("test_d") { callbacks.invoke_table_row_callbacks::<TestD>("test_d", diff, event); } },
+        __AppliedTableDiff::test_f(diff) => { if diff.has_changes() && callbacks.has_callbacks("test_f") { callbacks.invoke_table_row_callbacks::<TestFoobar>("test_f", diff, event); } },
+        __AppliedTableDiff::__Unused(_) => unreachable!(),
+        } }
 }
 }
 
@@ -1495,6 +1605,49 @@ pub struct RemoteTables {
 
 impl __sdk::InModule for RemoteTables {
     type Module = RemoteModule;
+}
+
+impl RemoteTables {
+    /// Receive owned initial rows by table name. Row must match the table type.
+    pub fn on_initial_owned<Row>(
+        &self,
+        table: &'static str,
+        callback: impl FnMut(&EventContext, Vec<Row>) + Send + 'static,
+    ) -> __sdk::CallbackId
+    where
+        Row: __sdk::InModule<Module = RemoteModule> + Clone + std::fmt::Debug + Send + Sync + 'static,
+    {
+        self.imp.get_table::<Row>(table).on_initial_owned(callback)
+    }
+
+    pub fn remove_on_initial_owned<Row>(&self, table: &'static str, callback: __sdk::CallbackId)
+    where
+        Row: __sdk::InModule<Module = RemoteModule> + Clone + std::fmt::Debug + Send + Sync + 'static,
+    {
+        self.imp.get_table::<Row>(table).remove_on_initial(callback)
+    }
+
+    /// Register a borrowed initial-row callback by table name. `Row` must be the
+    /// row type of that table. This avoids regenerating individual table handles
+    /// when migrating an existing client to borrowed snapshots.
+    pub fn on_initial_rows<Row>(
+        &self,
+        table: &'static str,
+        callback: impl FnMut(&EventContext, __sdk::InitialRows<'_, Row>) + Send + 'static,
+    ) -> __sdk::CallbackId
+    where
+        Row: __sdk::InModule<Module = RemoteModule> + Clone + std::fmt::Debug + Send + Sync + 'static,
+    {
+        self.imp.get_table::<Row>(table).on_initial_rows(callback)
+    }
+
+    /// Cancel a callback returned by `on_initial_rows` for the same table/type.
+    pub fn remove_on_initial_rows<Row>(&self, table: &'static str, callback: __sdk::CallbackId)
+    where
+        Row: __sdk::InModule<Module = RemoteModule> + Clone + std::fmt::Debug + Send + Sync + 'static,
+    {
+        self.imp.get_table::<Row>(table).remove_on_initial(callback)
+    }
 }
 
 /// A connection to a remote module, including a materialized view of a subset of the database.
@@ -2214,7 +2367,23 @@ impl<'ctx> MyPlayerTableHandle<'ctx> {
         MyPlayerInitialCallbackId(self.imp.on_initial(callback))
     }
 
-    /// Cancel a callback previously registered by [`Self::on_initial`].
+    /// Register a borrowed initial-row view without cloning the full snapshot.
+    pub fn on_initial_rows(
+        &self,
+        callback: impl FnMut(&super::EventContext, __sdk::InitialRows<'_, Player>) + Send + 'static,
+    ) -> MyPlayerInitialCallbackId {
+        MyPlayerInitialCallbackId(self.imp.on_initial_rows(callback))
+    }
+
+    /// Receive owned initial rows; cacheless single-listener dispatch moves payloads.
+    pub fn on_initial_owned(
+        &self,
+        callback: impl FnMut(&super::EventContext, Vec<Player>) + Send + 'static,
+    ) -> MyPlayerInitialCallbackId {
+        MyPlayerInitialCallbackId(self.imp.on_initial_owned(callback))
+    }
+
+    /// Cancel a callback registered by any initial-row registration method.
     pub fn remove_on_initial(&self, callback: MyPlayerInitialCallbackId) {
         self.imp.remove_on_initial(callback.0)
     }
@@ -2540,7 +2709,23 @@ impl<'ctx> PersonTableHandle<'ctx> {
         PersonInitialCallbackId(self.imp.on_initial(callback))
     }
 
-    /// Cancel a callback previously registered by [`Self::on_initial`].
+    /// Register a borrowed initial-row view without cloning the full snapshot.
+    pub fn on_initial_rows(
+        &self,
+        callback: impl FnMut(&super::EventContext, __sdk::InitialRows<'_, Person>) + Send + 'static,
+    ) -> PersonInitialCallbackId {
+        PersonInitialCallbackId(self.imp.on_initial_rows(callback))
+    }
+
+    /// Receive owned initial rows; cacheless single-listener dispatch moves payloads.
+    pub fn on_initial_owned(
+        &self,
+        callback: impl FnMut(&super::EventContext, Vec<Person>) + Send + 'static,
+    ) -> PersonInitialCallbackId {
+        PersonInitialCallbackId(self.imp.on_initial_owned(callback))
+    }
+
+    /// Cancel a callback registered by any initial-row registration method.
     pub fn remove_on_initial(&self, callback: PersonInitialCallbackId) {
         self.imp.remove_on_initial(callback.0)
     }
@@ -2940,7 +3125,23 @@ impl<'ctx> PlayerTableHandle<'ctx> {
         PlayerInitialCallbackId(self.imp.on_initial(callback))
     }
 
-    /// Cancel a callback previously registered by [`Self::on_initial`].
+    /// Register a borrowed initial-row view without cloning the full snapshot.
+    pub fn on_initial_rows(
+        &self,
+        callback: impl FnMut(&super::EventContext, __sdk::InitialRows<'_, Player>) + Send + 'static,
+    ) -> PlayerInitialCallbackId {
+        PlayerInitialCallbackId(self.imp.on_initial_rows(callback))
+    }
+
+    /// Receive owned initial rows; cacheless single-listener dispatch moves payloads.
+    pub fn on_initial_owned(
+        &self,
+        callback: impl FnMut(&super::EventContext, Vec<Player>) + Send + 'static,
+    ) -> PlayerInitialCallbackId {
+        PlayerInitialCallbackId(self.imp.on_initial_owned(callback))
+    }
+
+    /// Cancel a callback registered by any initial-row registration method.
     pub fn remove_on_initial(&self, callback: PlayerInitialCallbackId) {
         self.imp.remove_on_initial(callback.0)
     }
@@ -4012,7 +4213,23 @@ impl<'ctx> TestDTableHandle<'ctx> {
         TestDInitialCallbackId(self.imp.on_initial(callback))
     }
 
-    /// Cancel a callback previously registered by [`Self::on_initial`].
+    /// Register a borrowed initial-row view without cloning the full snapshot.
+    pub fn on_initial_rows(
+        &self,
+        callback: impl FnMut(&super::EventContext, __sdk::InitialRows<'_, TestD>) + Send + 'static,
+    ) -> TestDInitialCallbackId {
+        TestDInitialCallbackId(self.imp.on_initial_rows(callback))
+    }
+
+    /// Receive owned initial rows; cacheless single-listener dispatch moves payloads.
+    pub fn on_initial_owned(
+        &self,
+        callback: impl FnMut(&super::EventContext, Vec<TestD>) + Send + 'static,
+    ) -> TestDInitialCallbackId {
+        TestDInitialCallbackId(self.imp.on_initial_owned(callback))
+    }
+
+    /// Cancel a callback registered by any initial-row registration method.
     pub fn remove_on_initial(&self, callback: TestDInitialCallbackId) {
         self.imp.remove_on_initial(callback.0)
     }
@@ -4342,7 +4559,23 @@ impl<'ctx> TestFTableHandle<'ctx> {
         TestFInitialCallbackId(self.imp.on_initial(callback))
     }
 
-    /// Cancel a callback previously registered by [`Self::on_initial`].
+    /// Register a borrowed initial-row view without cloning the full snapshot.
+    pub fn on_initial_rows(
+        &self,
+        callback: impl FnMut(&super::EventContext, __sdk::InitialRows<'_, TestFoobar>) + Send + 'static,
+    ) -> TestFInitialCallbackId {
+        TestFInitialCallbackId(self.imp.on_initial_rows(callback))
+    }
+
+    /// Receive owned initial rows; cacheless single-listener dispatch moves payloads.
+    pub fn on_initial_owned(
+        &self,
+        callback: impl FnMut(&super::EventContext, Vec<TestFoobar>) + Send + 'static,
+    ) -> TestFInitialCallbackId {
+        TestFInitialCallbackId(self.imp.on_initial_owned(callback))
+    }
+
+    /// Cancel a callback registered by any initial-row registration method.
     pub fn remove_on_initial(&self, callback: TestFInitialCallbackId) {
         self.imp.remove_on_initial(callback.0)
     }

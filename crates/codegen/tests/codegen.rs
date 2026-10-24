@@ -41,6 +41,112 @@ declare_tests! {
 }
 
 #[test]
+fn rust_dispatch_guards_untouched_tables_before_cache_or_callback_lookup() {
+    let module = compiled_module();
+    let code = generate(module, &Rust, &CodegenOptions::default())
+        .into_iter()
+        .find(|file| file.filename == "mod.rs")
+        .expect("Rust global bindings")
+        .code;
+    let apply = code
+        .split("fn apply_to_client_cache_with_row_deduplication")
+        .nth(1)
+        .unwrap()
+        .split("fn mark_initial")
+        .next()
+        .unwrap();
+    assert!(code.contains("tables: Vec<__DbTableUpdate>"));
+    assert!(code.contains("tables: Vec<__AppliedTableDiff<'r>>"));
+    assert!(apply.contains("for update in &self.tables"));
+    assert!(apply.contains("if update.has_changes()"));
+    let arms = regex::Regex::new(r"__DbTableUpdate::\w+\(update\) => \{ if update\.has_changes\(\)").unwrap();
+    assert_eq!(
+        apply.matches("diff.tables.push(").count(),
+        arms.captures_iter(apply).count()
+    );
+    assert!(apply.contains("diff.tables.sort_unstable_by_key(__AppliedTableDiff::callback_order)"));
+    assert!(code.contains("self.tables.binary_search_by_key(&update.order(), __DbTableUpdate::order)"));
+    let callbacks = code.split("fn invoke_row_callbacks").nth(1).unwrap();
+    assert!(callbacks.contains("for table in &self.tables"));
+    let lookup = regex::Regex::new(r"if diff\.has_changes\(\) && callbacks\.has_callbacks\(").unwrap();
+    assert!(lookup.is_match(callbacks));
+    assert_eq!(
+        callbacks.matches("callbacks.has_callbacks(").count(),
+        lookup.captures_iter(callbacks).count()
+    );
+}
+
+/// Compile and execute the emitted bindings against the SDK in both cache modes.
+/// Kept opt-in because it performs nested Cargo builds in a separate target dir.
+#[test]
+#[ignore = "compiles generated Rust fixtures in a separate Cargo target directory"]
+fn rust_sparse_bindings_compile_and_preserve_snapshot_semantics() {
+    let root = std::env::var_os("SPACETIMEDB_CODEGEN_TEST_TMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("sparse-dispatch-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let bindings = root.join("src/module_bindings");
+    std::fs::create_dir_all(&bindings).unwrap();
+    for file in generate(compiled_module(), &Rust, &CodegenOptions::default()) {
+        let path = bindings.join(file.filename);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, file.code).unwrap();
+    }
+    // Modules without tables must still compile (especially AppliedDiff's lifetime).
+    let empty = ModuleDef::try_from(spacetimedb_lib::db::raw_def::v9::RawModuleDefV9::default()).unwrap();
+    for file in generate(&empty, &Rust, &CodegenOptions::default()) {
+        let path = root.join("src/empty_bindings").join(file.filename);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, file.code).unwrap();
+    }
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(bindings.join("mod.rs"))
+        .unwrap()
+        .write_all(include_bytes!("fixtures/rust_sparse_dispatch.rs"))
+        .unwrap();
+    std::fs::write(root.join("src/lib.rs"), "mod module_bindings;\nmod empty_bindings;\n").unwrap();
+    let sdk = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../sdks/rust")
+        .canonicalize()
+        .unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            r#"
+[package]
+name = "sparse-dispatch-fixture"
+version = "0.0.0"
+edition = "2024"
+[workspace]
+[features]
+default = ["client-cache"]
+client-cache = ["spacetimedb-sdk/client-cache"]
+[dependencies]
+spacetimedb-sdk = {{ path = {:?}, default-features = false }}
+"#,
+            sdk
+        ),
+    )
+    .unwrap();
+    for features in ["--no-default-features", "--all-features"] {
+        let result = std::process::Command::new(env!("CARGO"))
+            .args(["test", "--lib", "--jobs", "4", features, "--manifest-path"])
+            .arg(root.join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", root.join("target"))
+            .status()
+            .unwrap();
+        assert!(
+            result.success(),
+            "generated bindings failed ({features}); fixture: {}",
+            root.display()
+        );
+    }
+}
+
+#[test]
 fn test_typescript_table_handles_are_camel_case() {
     let module = compiled_module();
     let index = generate(module, &TypeScript, &CodegenOptions::default())

@@ -269,6 +269,13 @@ impl<Row> Default for TableUpdate<Row> {
 }
 
 impl<Row> TableUpdate<Row> {
+    /// Whether generated dispatch must process this table. An empty initial
+    /// snapshot is meaningful and must still reach initial callbacks.
+    #[inline]
+    pub fn has_changes(&self) -> bool {
+        self.initial || !self.is_empty()
+    }
+
     pub fn append(&mut self, other: TableUpdate<Row>) {
         Self::append_rows(&mut self.inserts, other.inserts);
         Self::append_rows(&mut self.deletes, other.deletes);

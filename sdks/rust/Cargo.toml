@@ -42,7 +42,8 @@ brotli.workspace = true
 bytes.workspace = true
 flate2.workspace = true
 futures.workspace = true
-futures-channel.workspace = true
+# try_recv() replaces the deprecated try_next() API.
+futures-channel = "0.3.34"
 http.workspace = true
 log.workspace = true
 once_cell.workspace = true
@@ -65,8 +66,9 @@ tokio.workspace = true
 tokio-websockets.workspace = true
 
 [dev-dependencies]
-futures-channel.workspace = true
+futures-channel = "0.3.34"
 shlex = "1.3.0"
+tokio = { workspace = true, features = ["test-util"] }
 
 # for tests
 spacetimedb-testing = { path = "../../crates/testing" }

@@ -370,7 +370,7 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
 
     /// Apply all queued [`PendingMutation`]s.
     fn apply_pending_mutations(&self) -> crate::Result<()> {
-        while let Ok(Some(pending_mutation)) = get_lock_sync(&self.pending_mutations_recv).try_next() {
+        while let Ok(pending_mutation) = get_lock_sync(&self.pending_mutations_recv).try_recv() {
             self.apply_mutation(pending_mutation)?;
         }
 
@@ -595,21 +595,11 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
         // so that pending callbacks don't get skipped.
         self.apply_pending_mutations()?;
 
-        // Deranged behavior: mpsc's `try_next` returns `Ok(None)` when the channel is closed,
-        // and `Err(_)` when the channel is open and waiting. This seems exactly backwards.
-        //
-        // NOTE(cloutiertyler): A comment on the deranged behavior: the mental
-        // model is that of an iterator, but for a stream instead. i.e. you pull
-        // off of an iterator until it returns `None`, which means that the
-        // iterator is exhausted. If you try to pull off the iterator and
-        // there's nothing there but it's not exhausted, it (arguably sensibly)
-        // returns `Err(_)`. Similar behavior as `Iterator::next` and
-        // `Stream::poll_next`. No comment on whether this is a good mental
-        // model or not.
-        let res = match get_lock_sync(&self.recv).try_next() {
-            Ok(None) => Err(self.end_connection(None)),
-            Err(_) => Ok(false),
-            Ok(Some(msg)) => self.process_message(msg).map(|_| true),
+        // An empty open queue is idle; a drained closed queue ends the connection.
+        let res = match get_lock_sync(&self.recv).try_recv() {
+            Err(mpsc::TryRecvError::Closed) => Err(self.end_connection(None)),
+            Err(mpsc::TryRecvError::Empty) => Ok(false),
+            Ok(msg) => self.process_message(msg).map(|_| true),
         };
 
         // Also apply any new pending messages afterwards,
@@ -633,8 +623,8 @@ impl<M: SpacetimeModule> DbContextImpl<M> {
         // This may be unnecessary, but `tokio::select` does not document any ordering guarantees,
         // and if both `pending_mutations.next()` and `recv.next()` have values ready,
         // we want to process the pending mutation first.
-        if let Ok(pending_mutation) = pending_mutations.try_next() {
-            return Message::Local(pending_mutation.unwrap());
+        if let Ok(pending_mutation) = pending_mutations.try_recv() {
+            return Message::Local(pending_mutation);
         }
 
         #[cfg(not(feature = "browser"))]

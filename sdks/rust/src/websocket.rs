@@ -42,6 +42,50 @@ type WebSocketError = tokio_websockets::Error;
 #[cfg(feature = "browser")]
 type WebSocketError = tokio_tungstenite_wasm::Error;
 
+#[cfg(not(feature = "browser"))]
+fn heartbeat_interval(idle_timeout: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(Instant::now() + idle_timeout, idle_timeout);
+    // Decoding/profiling or scheduler stalls can delay this task for multiple
+    // periods. Do not replay overdue checks back-to-back: a catch-up tick could
+    // otherwise time out a ping before the peer has a chance to answer it.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+#[cfg(all(test, not(feature = "browser")))]
+mod heartbeat_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn missed_heartbeat_ticks_are_not_replayed_in_a_burst() {
+        let start = Instant::now();
+        let mut interval = heartbeat_interval(Duration::from_secs(30));
+        assert!(futures::poll!(Box::pin(interval.tick())).is_pending());
+
+        // Simulate a task that cannot poll its heartbeat for over three periods.
+        tokio::time::advance(Duration::from_secs(95)).await;
+        assert_eq!(interval.tick().await, start + Duration::from_secs(30));
+        assert!(futures::poll!(Box::pin(interval.tick())).is_pending());
+
+        tokio::time::advance(Duration::from_secs(24)).await;
+        assert!(futures::poll!(Box::pin(interval.tick())).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(interval.tick().await, start + Duration::from_secs(120));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn on_time_heartbeats_keep_the_existing_first_delay_and_cadence() {
+        let start = Instant::now();
+        let mut interval = heartbeat_interval(Duration::from_secs(30));
+        for tick in 1..=3 {
+            tokio::time::advance(Duration::from_secs(29)).await;
+            assert!(futures::poll!(Box::pin(interval.tick())).is_pending());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert_eq!(interval.tick().await, start + Duration::from_secs(tick * 30));
+        }
+    }
+}
+
 #[derive(Error, Debug, Clone)]
 pub enum UriError {
     #[error("Unknown URI scheme {scheme}, expected http, https, ws or wss")]
@@ -435,7 +479,7 @@ impl WsConnection {
         // If both ends cannot communicate, we assume the server has already
         // timed out the client, and so don't bother sending a `Close` frame.
         const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-        let mut idle_timeout_interval = tokio::time::interval_at(Instant::now() + IDLE_TIMEOUT, IDLE_TIMEOUT);
+        let mut idle_timeout_interval = heartbeat_interval(IDLE_TIMEOUT);
 
         let mut idle = true;
         let mut want_pong = false;

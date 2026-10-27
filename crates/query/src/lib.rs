@@ -76,7 +76,7 @@ pub fn execute_select_stmt<Tx: Datastore + DeltaStore>(
     metrics: &mut ExecutionMetrics,
     check_row_limit: impl Fn(ProjectListPlan) -> Result<ProjectListPlan>,
 ) -> Result<Vec<ProductValue>> {
-    let plan = compile_select_list(stmt).optimize()?;
+    let plan = compile_select_list(stmt).optimize_with_row_counts(&|id| Some(tx.row_count(id)))?;
     let plan = check_row_limit(plan)?;
     let plan = ProjectListExecutor::from(plan);
     let params = ExecutionParams::from_auth(auth);

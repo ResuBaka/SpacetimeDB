@@ -32,6 +32,7 @@ use tokio_websockets::{
     ClientBuilder, Connector, Limits, MaybeTlsStream, Message as WebSocketMessage, WebSocketStream,
 };
 
+#[cfg(not(feature = "streaming-decompression"))]
 use crate::compression::decompress_server_message;
 #[cfg(not(feature = "browser"))]
 use crate::db_connection::debug_log;
@@ -422,8 +423,15 @@ impl WsConnection {
     }
 
     pub(crate) fn parse_response(bytes: &[u8]) -> Result<ws::v2::ServerMessage, WsError> {
-        let bytes = &*decompress_server_message(bytes)?;
-        bsatn::from_slice(bytes).map_err(|source| WsError::DeserializeMessage { source })
+        #[cfg(feature = "streaming-decompression")]
+        {
+            crate::streaming_decompression::decode(bytes)
+        }
+        #[cfg(not(feature = "streaming-decompression"))]
+        {
+            let bytes = &*decompress_server_message(bytes)?;
+            bsatn::from_slice(bytes).map_err(|source| WsError::DeserializeMessage { source })
+        }
     }
 
     #[cfg(feature = "browser")]

@@ -33,6 +33,7 @@ members = [
   "crates/schema",
   "crates/smoketests",
   "sdks/rust",
+  "sdks/rust/benches/streaming_decompression",
   "sdks/unreal",
   "crates/snapshot",
   "crates/sqltest",
@@ -198,7 +199,8 @@ base64 = "0.21.2"
 bigdecimal = "0.4.7"
 bitflags = "2.3.3"
 blake3 = "1.5.1"
-brotli = "3.5"
+brotli = "9.0.0"
+lz4_flex = { version = "0.12" }
 bytemuck = { version = "1.16.2", features = ["must_cast"] }
 bytes = "1.10.1"
 bytestring = { version = "1.2.0", features = ["serde"] }

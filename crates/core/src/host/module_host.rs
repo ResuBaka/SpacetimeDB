@@ -3382,7 +3382,11 @@ impl ModuleHost {
         // Optimize each fragment.
         let optimized = plans
             .into_iter()
-            .map(|plan| plan.optimize())
+            .map(|plan| {
+                plan.optimize_with_row_counts(&|id| {
+                    spacetimedb_expr::check::SchemaView::table_row_count_hint(&schema_tx, id)
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         check_row_limit(

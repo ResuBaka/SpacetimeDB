@@ -97,10 +97,15 @@ impl CollectViews for ProjectPlan {
 
 impl ProjectPlan {
     pub fn optimize(self) -> Result<Self> {
+        self.optimize_with_row_counts(&|_| None)
+    }
+
+    /// Optimize using optional table cardinalities from the current transaction.
+    pub fn optimize_with_row_counts(self, row_count: &impl Fn(TableId) -> Option<u64>) -> Result<Self> {
         match self {
-            Self::None(plan) => Ok(Self::None(plan.optimize(vec![])?)),
+            Self::None(plan) => Ok(Self::None(plan.optimize_with_row_counts(vec![], row_count)?)),
             Self::Name(plan, label, _) => {
-                let plan = plan.optimize(vec![label])?;
+                let plan = plan.optimize_with_row_counts(vec![label], row_count)?;
                 let n = plan.nfields();
                 let pos = plan.position(&label);
                 Ok(match n {
@@ -182,12 +187,19 @@ pub enum ProjectListPlan {
 
 impl ProjectListPlan {
     pub fn optimize(self) -> Result<Self> {
+        self.optimize_with_row_counts(&|_| None)
+    }
+
+    /// Optimize using optional table cardinalities from the current transaction.
+    pub fn optimize_with_row_counts(self, row_count: &impl Fn(TableId) -> Option<u64>) -> Result<Self> {
         match self {
             Self::Name(plan) => Ok(Self::Name(
-                plan.into_iter().map(|plan| plan.optimize()).collect::<Result<_>>()?,
+                plan.into_iter()
+                    .map(|plan| plan.optimize_with_row_counts(row_count))
+                    .collect::<Result<_>>()?,
             )),
             Self::Limit(plan, n) => {
-                let mut limit = Self::Limit(Box::new(plan.optimize()?), n);
+                let mut limit = Self::Limit(Box::new(plan.optimize_with_row_counts(row_count)?), n);
                 // Merge a limit with a scan if possible
                 if PushLimit::matches(&limit).is_some() {
                     limit = PushLimit::rewrite(limit, ())?;
@@ -196,7 +208,7 @@ impl ProjectListPlan {
             }
             Self::Agg(plan, agg_type) => Ok(Self::Agg(
                 plan.into_iter()
-                    .map(|plan| plan.optimize(vec![]))
+                    .map(|plan| plan.optimize_with_row_counts(vec![], row_count))
                     .collect::<Result<_>>()?,
                 agg_type,
             )),
@@ -206,7 +218,7 @@ impl ProjectListPlan {
                     // Collect the names of the relvars
                     let labels = fields.iter().map(|field| field.label).collect();
                     // Optimize each plan
-                    let optimized_plan = plan.optimize(labels)?;
+                    let optimized_plan = plan.optimize_with_row_counts(labels, row_count)?;
                     // Compute the position of each relvar referenced in the projection
                     for TupleField { label, label_pos, .. } in &mut fields {
                         *label_pos = optimized_plan.position(label);
@@ -489,9 +501,20 @@ impl PhysicalPlan {
     /// 4. Determine index and semijoins
     /// 5. Compute positions for tuple labels
     pub fn optimize(self, reqs: Vec<Label>) -> Result<Self> {
+        self.optimize_with_row_counts(reqs, &|_| None)
+    }
+
+    /// Use row counts only for an unfiltered two-table, one-to-one indexed join.
+    /// Other plans retain the existing heuristics, especially delta joins.
+    pub fn optimize_with_row_counts(
+        self,
+        reqs: Vec<Label>,
+        row_count: &impl Fn(TableId) -> Option<u64>,
+    ) -> Result<Self> {
         let optimized = self
             .expand_views()
             .map(&Self::canonicalize)
+            .reorder_unique_join(row_count)?
             .apply_rec::<PushConstAnd>()?
             .apply_rec::<PushConstEq>()?
             .apply_rec::<ReorderDeltaJoinRhs>()?
@@ -547,6 +570,41 @@ impl PhysicalPlan {
         }
 
         Ok(optimized)
+    }
+
+    /// Reorder only the root join; do not change joins inside complex queries.
+    fn reorder_unique_join(self, row_count: &impl Fn(TableId) -> Option<u64>) -> Result<Self> {
+        if let Self::HashJoin(join, Semi::All) = &self
+            && let (Self::TableScan(lhs, lhs_label), Self::TableScan(rhs, rhs_label)) = (&*join.lhs, &*join.rhs)
+            && lhs.delta.is_none()
+            && rhs.delta.is_none()
+            && lhs.limit.is_none()
+            && rhs.limit.is_none()
+            && !lhs.schema.is_event
+            && !rhs.schema.is_event
+            && !lhs.schema.is_view()
+            && !rhs.schema.is_view()
+            && join.lhs_field.label == *lhs_label
+            && join.rhs_field.label == *rhs_label
+        {
+            let indexed_unique = |scan: &TableScan, field: &TupleField| {
+                let col = ColId(field.field_pos as u16);
+                scan.schema.is_unique(&spacetimedb_primitives::ColList::new(col))
+                    && scan
+                        .schema
+                        .indexes
+                        .iter()
+                        .any(|index| index.index_algorithm.columns().as_singleton() == Some(col))
+            };
+            if indexed_unique(lhs, &join.lhs_field)
+                && indexed_unique(rhs, &join.rhs_field)
+                && let (Some(left), Some(right)) = (row_count(lhs.schema.table_id), row_count(rhs.schema.table_id))
+                && right < left
+            {
+                return ReorderHashJoin::rewrite(self, ());
+            }
+        }
+        Ok(self)
     }
 
     /// If a view has private arguments, its backing table has an `arg_hash` column.
@@ -1751,6 +1809,316 @@ mod tests {
             }
             proj => panic!("unexpected project: {proj:#?}"),
         };
+    }
+
+    /// Both join keys are indexed and unique, but optimization has no table
+    /// cardinality statistics: reversing FROM/JOIN reverses the driving scan.
+    /// This matters to the row-limit estimator even when the projected table
+    /// and the query's results are unchanged.
+    #[test]
+    fn indexed_join_driving_table_follows_from_order() {
+        let large_id = TableId(1);
+        let small_id = TableId(2);
+        let db = SchemaViewer {
+            schemas: vec![
+                Arc::new(schema(
+                    large_id,
+                    "large",
+                    &[("id", AlgebraicType::U64)],
+                    &[&[0]],
+                    &[&[0]],
+                    Some(0),
+                )),
+                Arc::new(schema(
+                    small_id,
+                    "small",
+                    &[("id", AlgebraicType::U64)],
+                    &[&[0]],
+                    &[&[0]],
+                    Some(0),
+                )),
+            ],
+        };
+        for (sql, expected_driver, expected_lookup) in [
+            (
+                "select small.* from large join small on large.id = small.id",
+                large_id,
+                small_id,
+            ),
+            (
+                "select small.* from small join large on small.id = large.id",
+                small_id,
+                large_id,
+            ),
+        ] {
+            let plan = compile_select(parse_and_type_sub(sql, &db).unwrap())
+                .optimize()
+                .unwrap();
+            let PhysicalPlan::IxJoin(join, _) = plan.physical_plan() else {
+                panic!("expected index join for {sql}: {plan:#?}");
+            };
+            assert!(join.unique);
+            assert_eq!(join.rhs.table_id, expected_lookup);
+            let PhysicalPlan::TableScan(scan, _) = &*join.lhs else {
+                panic!("expected driving table scan for {sql}: {plan:#?}");
+            };
+            assert_eq!(scan.schema.table_id, expected_driver);
+        }
+    }
+
+    /// Reproduce the location/building join with the reported index column
+    /// layouts and unique entity_id constraints. Unreferenced column types do
+    /// not affect this query; the entity_id columns are the only join fields.
+    #[test]
+    fn location_building_join_uses_unique_entity_index_and_follows_from_order() {
+        let location_id = TableId(1);
+        let building_id = TableId(2);
+        let db = SchemaViewer {
+            schemas: vec![
+                Arc::new(schema(
+                    location_id,
+                    "location_state",
+                    &[
+                        ("entity_id", AlgebraicType::U64),
+                        ("chunk_index", AlgebraicType::U64),
+                        ("x", AlgebraicType::U64),
+                        ("z", AlgebraicType::U64),
+                    ],
+                    &[&[1], &[2, 3, 1], &[0]],
+                    &[&[0]],
+                    Some(0),
+                )),
+                Arc::new(schema(
+                    building_id,
+                    "building_state",
+                    &[
+                        ("entity_id", AlgebraicType::U64),
+                        ("claim_entity_id", AlgebraicType::U64),
+                        ("unused", AlgebraicType::U64),
+                        ("building_description_id", AlgebraicType::U64),
+                        ("constructed_by_player_entity_id", AlgebraicType::U64),
+                    ],
+                    &[&[3], &[4, 3], &[1], &[0]],
+                    &[&[0]],
+                    Some(0),
+                )),
+            ],
+        };
+        for (sql, driver, lookup, index) in [
+            (
+                "SELECT location_state.* FROM location_state JOIN building_state \
+                 ON location_state.entity_id = building_state.entity_id",
+                location_id,
+                building_id,
+                3usize,
+            ),
+            (
+                "SELECT location_state.* FROM building_state JOIN location_state \
+                 ON location_state.entity_id = building_state.entity_id",
+                building_id,
+                location_id,
+                2usize,
+            ),
+        ] {
+            let plan = compile_select(parse_and_type_sub(sql, &db).unwrap())
+                .optimize()
+                .unwrap();
+            let PhysicalPlan::IxJoin(join, _) = plan.physical_plan() else {
+                panic!("expected entity_id index join for {sql}: {plan:#?}");
+            };
+            assert!(join.unique, "entity_id uniqueness must be recognized");
+            assert_eq!(join.rhs.table_id, lookup);
+            assert_eq!(join.rhs_index, index.into());
+            let PhysicalPlan::TableScan(scan, _) = &*join.lhs else {
+                panic!("expected driving scan for {sql}: {plan:#?}");
+            };
+            assert_eq!(scan.schema.table_id, driver);
+            for (location_rows, building_rows) in [
+                (Some(1_000_000), Some(1_000)),
+                (Some(1_000), Some(1_000_000)),
+                (Some(1_000), Some(0)),
+                (Some(100), Some(100)),
+                (None, Some(1)),
+                (Some(100), None),
+            ] {
+                let counts = |id| {
+                    if id == location_id {
+                        location_rows
+                    } else {
+                        building_rows
+                    }
+                };
+                let expected_driver = match (location_rows, building_rows) {
+                    (Some(l), Some(b)) if l < b => location_id,
+                    (Some(l), Some(b)) if b < l => building_id,
+                    _ => driver,
+                };
+                let plan = compile_select(parse_and_type_sub(sql, &db).unwrap())
+                    .optimize_with_row_counts(&counts)
+                    .unwrap();
+                let PhysicalPlan::IxJoin(join, semi) = plan.physical_plan() else {
+                    panic!("expected index join: {plan:#?}");
+                };
+                let PhysicalPlan::TableScan(scan, _) = &*join.lhs else {
+                    panic!("expected driving scan: {plan:#?}");
+                };
+                assert_eq!(scan.schema.table_id, expected_driver);
+                assert!(join.unique);
+                // The selected table remains location_state after swapping.
+                if expected_driver == building_id {
+                    assert_eq!(join.rhs.table_id, location_id);
+                    assert_eq!(*semi, Semi::Rhs);
+                    assert_eq!(join.rhs_index, 2usize.into());
+                } else {
+                    assert_eq!(join.rhs.table_id, building_id);
+                    assert_eq!(*semi, Semi::Lhs);
+                    assert_eq!(join.rhs_index, 3usize.into());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn row_count_join_preserves_explicit_projection_positions() {
+        let db = SchemaViewer {
+            schemas: vec![
+                Arc::new(schema(
+                    TableId(1),
+                    "a",
+                    &[("id", AlgebraicType::U64)],
+                    &[&[0]],
+                    &[&[0]],
+                    Some(0),
+                )),
+                Arc::new(schema(
+                    TableId(2),
+                    "b",
+                    &[("id", AlgebraicType::U64)],
+                    &[&[0]],
+                    &[&[0]],
+                    Some(0),
+                )),
+            ],
+        };
+        for sql in [
+            "select a.id as a_id, b.id as b_id from a join b on a.id = b.id",
+            "select a.id as a_id, b.id as b_id from b join a on a.id = b.id",
+        ] {
+            let Statement::Select(stmt) = parse_and_type_sql(sql, &db, &AuthCtx::for_testing()).unwrap() else {
+                panic!("expected select");
+            };
+            let plan = compile_select_list(stmt)
+                .optimize_with_row_counts(&|id| Some(if id == TableId(1) { 1000 } else { 1 }))
+                .unwrap();
+            let ProjectListPlan::List(plans, fields) = plan else {
+                panic!("expected explicit projection");
+            };
+            let PhysicalPlan::IxJoin(join, Semi::All) = &plans[0] else {
+                panic!("expected full index join");
+            };
+            assert_eq!(join.rhs.table_id, TableId(1));
+            assert_eq!(fields[0].label, join.rhs_label);
+            assert_eq!(fields[0].label_pos, Some(1));
+            assert_eq!(fields[1].label_pos, Some(0));
+        }
+    }
+
+    #[test]
+    fn row_count_join_reordering_is_narrowly_scoped() {
+        let make_schema = |id, name| {
+            schema(
+                id,
+                name,
+                &[("id", AlgebraicType::U64), ("value", AlgebraicType::U64)],
+                &[&[0]],
+                &[&[0]],
+                Some(0),
+            )
+        };
+        let sql = "select a.* from a join b on a.id = b.id";
+        let counts = |id| Some(if id == TableId(1) { 1000 } else { 1 });
+        for excluded in 0..5 {
+            let mut a = (*make_schema(TableId(1), "a").inner()).clone();
+            let b = make_schema(TableId(2), "b");
+            match excluded {
+                0 => a.constraints.clear(),
+                1 => a.indexes.clear(),
+                2 => a.is_event = true,
+                _ => {}
+            }
+            let db = SchemaViewer {
+                schemas: vec![Arc::new(Arc::new(a).into()), Arc::new(b)],
+            };
+            let mut plan = compile_select(parse_and_type_sub(sql, &db).unwrap());
+            let (ProjectPlan::None(input) | ProjectPlan::Name(input, ..)) = &mut plan;
+            if let PhysicalPlan::HashJoin(join, _) = input {
+                if let PhysicalPlan::TableScan(scan, _) = &mut *join.lhs {
+                    match excluded {
+                        3 => scan.limit = Some(10),
+                        4 => scan.delta = Some(spacetimedb_lib::query::Delta::Inserts),
+                        _ => {}
+                    }
+                }
+            }
+            let ordinary = plan.clone().optimize().unwrap();
+            let counted = plan.optimize_with_row_counts(&counts).unwrap();
+            assert_eq!(format!("{ordinary:?}"), format!("{counted:?}"));
+        }
+        let db = SchemaViewer {
+            schemas: vec![
+                Arc::new(make_schema(TableId(1), "a")),
+                Arc::new(make_schema(TableId(2), "b")),
+                Arc::new(make_schema(TableId(3), "c")),
+            ],
+        };
+        for sql in [
+            "select a.* from a join b on a.id = b.id where a.value = 5",
+            "select a.* from a join b on a.id = b.id join c on b.id = c.id",
+        ] {
+            let plan = compile_select(parse_and_type_sub(sql, &db).unwrap());
+            let ordinary = plan.clone().optimize().unwrap();
+            let counted = plan.optimize_with_row_counts(&counts).unwrap();
+            assert_eq!(format!("{ordinary:?}"), format!("{counted:?}"));
+        }
+    }
+
+    /// An index beginning with the join key is not sufficient for the current
+    /// point-probe index-join rewrite: all index columns must be supplied.
+    /// The remaining non-unique hash join is a particularly pessimistic case
+    /// for the core row-limit estimator, which uses a Cartesian-product bound.
+    #[test]
+    fn composite_index_prefix_join_remains_hash_join() {
+        let db = SchemaViewer {
+            schemas: vec![
+                Arc::new(schema(
+                    TableId(1),
+                    "a",
+                    &[("id", AlgebraicType::U64), ("value", AlgebraicType::U64)],
+                    &[&[0, 1]],
+                    &[],
+                    None,
+                )),
+                Arc::new(schema(
+                    TableId(2),
+                    "b",
+                    &[("id", AlgebraicType::U64), ("value", AlgebraicType::U64)],
+                    &[&[0, 1]],
+                    &[],
+                    None,
+                )),
+            ],
+        };
+        let sql = "select a.* from a join b on a.id = b.id";
+        let plan = compile_select(parse_and_type_sub(sql, &db).unwrap())
+            .optimize()
+            .unwrap();
+        assert!(
+            matches!(
+                plan.physical_plan(),
+                PhysicalPlan::HashJoin(super::HashJoin { unique: false, .. }, _)
+            ),
+            "expected non-unique hash join for an unbound composite-index suffix: {plan:#?}"
+        );
     }
 
     /// No rewrites applied to a table scan + filter

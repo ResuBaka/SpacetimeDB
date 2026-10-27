@@ -25,6 +25,11 @@ pub type TypingResult<T> = core::result::Result<T, TypingError>;
 
 /// A view of the database schema
 pub trait SchemaView {
+    /// Optional transaction-local cardinality hint for choosing a driving table.
+    fn table_row_count_hint(&self, _table_id: TableId) -> Option<u64> {
+        None
+    }
+
     fn table_id(&self, name: &str) -> Option<TableId>;
     fn schema_for_table(&self, table_id: TableId) -> Option<Arc<TableOrViewSchema>>;
     fn rls_rules_for_table(&self, table_id: TableId) -> anyhow::Result<Vec<Box<str>>>;

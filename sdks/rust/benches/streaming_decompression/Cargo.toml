@@ -1,0 +1,43 @@
+# Separate package avoids compiling the SDK's server-heavy test dependencies.
+[package]
+name = "streaming-decompression-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+default-run = "streaming-decompression-bench"
+
+[[bin]]
+name = "streaming-decompression-bench"
+path = "../streaming_decompression.rs"
+
+[[bin]]
+name = "compression-tradeoff-bench"
+path = "compression_tradeoff.rs"
+
+[[bin]]
+name = "compression-pipeline-bench"
+path = "compression_pipeline.rs"
+
+[[test]]
+name = "streaming_decompression"
+path = "tests.rs"
+
+[[test]]
+name = "experimental_zstd"
+path = "zstd_tests.rs"
+
+[[test]]
+name = "experimental_lz4"
+path = "lz4_tests.rs"
+
+[dependencies]
+spacetimedb-sdk = { path = "../..", features = ["streaming-decompression"] }
+spacetimedb-client-api-messages.workspace = true
+spacetimedb-sats.workspace = true
+brotli.workspace = true
+flate2.workspace = true
+zstd = { version = "0.13.3", features = ["zstdmt"] }
+lz4_flex.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

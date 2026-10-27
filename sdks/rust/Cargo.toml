@@ -14,6 +14,8 @@ client-cache = ["dep:anymap3"]
 # Preserve raw row bytes for cacheless consumers that inspect WithBsatn::bsatn.
 # The client cache always retains them, regardless of this feature.
 retain-row-bytes = []
+# Experimental owned decoder; intentionally not enabled by default.
+streaming-decompression = []
 allow_loopback_http_for_tests = ["spacetimedb-testing/allow_loopback_http_for_tests"]
 browser = [
     "dep:getrandom",
@@ -73,5 +75,20 @@ tokio = { workspace = true, features = ["test-util"] }
 # for tests
 spacetimedb-testing = { path = "../../crates/testing" }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Native-only experimental benchmark; not linked into the SDK itself.
+zstd = "0.13.3"
+lz4_flex.workspace = true
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "streaming_decompression"
+harness = false
+required-features = ["streaming-decompression"]
+
+[[test]]
+name = "streaming_decompression"
+path = "benches/streaming_decompression/tests.rs"
+required-features = ["streaming-decompression"]

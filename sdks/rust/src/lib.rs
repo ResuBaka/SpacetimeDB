@@ -16,6 +16,8 @@ mod compression;
 mod db_connection;
 mod metrics;
 mod spacetime_module;
+#[cfg(feature = "streaming-decompression")]
+mod streaming_decompression;
 mod subscription;
 mod websocket;
 
@@ -92,4 +94,25 @@ pub mod unstable {
     //! These may change incompatibly without a major version bump.
     pub use crate::db_connection::set_connection_id;
     pub use crate::metrics::{ClientMetrics, CLIENT_METRICS};
+
+    /// Comparison hooks for the streaming-decompression experiment, not stable API.
+    #[cfg(feature = "streaming-decompression")]
+    pub mod streaming_decompression {
+        use spacetimedb_client_api_messages::websocket::v2::ServerMessage;
+
+        pub fn buffered(bytes: &[u8]) -> Result<ServerMessage, String> {
+            let bytes = crate::compression::decompress_server_message(bytes).map_err(|e| e.to_string())?;
+            spacetimedb_sats::bsatn::from_slice(&bytes).map_err(|e| e.to_string())
+        }
+
+        pub fn streaming(bytes: &[u8]) -> Result<ServerMessage, String> {
+            crate::streaming_decompression::decode(bytes).map_err(|e| e.to_string())
+        }
+
+        /// Decode owned BSATN from an experimental codec, draining it before
+        /// returning. This hook does not add a compression tag to the SDK protocol.
+        pub fn from_reader(reader: impl std::io::Read, scheme: &'static str) -> Result<ServerMessage, String> {
+            crate::streaming_decompression::decode_reader(reader, scheme).map_err(|e| e.to_string())
+        }
+    }
 }

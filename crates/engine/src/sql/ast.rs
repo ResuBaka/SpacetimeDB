@@ -23,6 +23,10 @@ impl<T> Deref for SchemaViewer<'_, T> {
 }
 
 impl<T: StateView> SchemaView for SchemaViewer<'_, T> {
+    fn table_row_count_hint(&self, table_id: TableId) -> Option<u64> {
+        self.tx.table_row_count(table_id)
+    }
+
     fn table_id(&self, name: &str) -> Option<TableId> {
         self.tx
             .table_id_from_name_or_alias(name)

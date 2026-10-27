@@ -643,7 +643,9 @@ impl SubscriptionPlan {
         let params = ExecutionParams::from_auth(auth);
 
         for plan in plans {
-            let plan_opt = plan.clone().optimize()?;
+            let plan_opt = plan
+                .clone()
+                .optimize_with_row_counts(&|id| tx.table_row_count_hint(id))?;
 
             if has_non_index_join(&plan_opt) {
                 bail!("Subscriptions require indexes on join columns")

@@ -450,6 +450,7 @@ impl WsConnection {
         incoming_messages: mpsc::UnboundedSender<ws::v2::ServerMessage>,
         outgoing_messages: mpsc::UnboundedReceiver<ws::v2::ClientMessage>,
         extra_logging: Option<Arc<Mutex<File>>>,
+        mut capture: Option<crate::payload_capture::PayloadCapture>,
     ) {
         let websocket_received = CLIENT_METRICS.websocket_received.with_label_values(&self.db_name);
         let websocket_received_msg_size = CLIENT_METRICS
@@ -520,11 +521,26 @@ impl WsConnection {
                                 "Error decoding WebSocketMessage::Binary payload",
                                 Result::<(), _>::Err(e)
                             ),
-                            Ok(msg) => maybe_log_error!(
-                                &extra_logging,
-                                "Error sending decoded message to incoming_messages queue",
-                                incoming_messages.unbounded_send(msg)
-                            ),
+                            Ok(msg) => {
+                                if let Some(writer) = &mut capture {
+                                    match writer.record_message(&bytes) {
+                                        Ok(true) => {},
+                                        Ok(false) => {
+                                            log::info!("BSATN capture reached its size limit");
+                                            capture = None;
+                                        }
+                                        Err(error) => {
+                                            log::warn!("BSATN capture stopped: {error}");
+                                            capture = None;
+                                        }
+                                    }
+                                }
+                                maybe_log_error!(
+                                    &extra_logging,
+                                    "Error sending decoded message to incoming_messages queue",
+                                    incoming_messages.unbounded_send(msg)
+                                )
+                            },
                         }
                     }
 
@@ -595,6 +611,7 @@ impl WsConnection {
         self,
         runtime: &runtime::Handle,
         extra_logging: Option<Arc<Mutex<File>>>,
+        capture: Option<crate::payload_capture::PayloadCapture>,
     ) -> (
         JoinHandle<()>,
         mpsc::UnboundedReceiver<ws::v2::ServerMessage>,
@@ -602,7 +619,7 @@ impl WsConnection {
     ) {
         let (outgoing_send, outgoing_recv) = mpsc::unbounded();
         let (incoming_send, incoming_recv) = mpsc::unbounded();
-        let handle = runtime.spawn(self.message_loop(incoming_send, outgoing_recv, extra_logging));
+        let handle = runtime.spawn(self.message_loop(incoming_send, outgoing_recv, extra_logging, capture));
         (handle, incoming_recv, outgoing_send)
     }
 

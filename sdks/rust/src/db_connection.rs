@@ -878,6 +878,9 @@ pub struct DbConnectionBuilder<M: SpacetimeModule> {
 
     additional_logging_path: Option<PathBuf>,
 
+    #[cfg(not(feature = "browser"))]
+    payload_capture: Option<(PathBuf, u64)>,
+
     params: WsParams,
 
     deduplicate_rows: bool,
@@ -937,6 +940,8 @@ impl<M: SpacetimeModule> DbConnectionBuilder<M> {
             on_connect_error: None,
             on_disconnect: None,
             additional_logging_path: None,
+            #[cfg(not(feature = "browser"))]
+            payload_capture: None,
             params: <_>::default(),
             deduplicate_rows: true,
         }
@@ -984,6 +989,11 @@ but you must call one of them, or else the connection will never progress.
     /// to construct a [`DbContextImpl`].
     #[cfg(not(feature = "browser"))]
     fn build_impl(self) -> crate::Result<DbContextImpl<M>> {
+        let payload_capture = self.payload_capture.map(|(path, limit)| {
+            crate::payload_capture::PayloadCapture::create(&path, limit).map_err(|e| {
+                InternalError::new(format!("Failed to create BSATN capture file '{path:?}'")).with_cause(e)
+            })
+        }).transpose()?;
         let extra_logging = self
             .additional_logging_path
             .map(|path| {
@@ -1011,7 +1021,7 @@ but you must call one of them, or else the connection will never progress.
         })?;
 
         let (_websocket_loop_handle, raw_msg_recv, raw_msg_send) =
-            ws_connection.spawn_message_loop(&handle, extra_logging.clone());
+            ws_connection.spawn_message_loop(&handle, extra_logging.clone(), payload_capture);
         let (_parse_loop_handle, parsed_recv_chan) =
             spawn_parse_loop::<M>(raw_msg_recv, &handle, extra_logging.clone());
         let parsed_recv_chan = Arc::new(TokioMutex::new(parsed_recv_chan));
@@ -1115,6 +1125,26 @@ but you must call one of them, or else the connection will never progress.
     /// Note however that this threshold is not guaranteed and may change without notice.
     pub fn with_compression(mut self, compression: ws::common::Compression) -> Self {
         self.params.compression = compression;
+        self
+    }
+
+    /// Capture successfully decoded server messages as decompressed BSATN.
+    ///
+    /// Native only. The file is created exclusively and will not overwrite an
+    /// existing file. Use a distinct path for every connection and reconnect.
+    /// `max_bytes` limits the entire file, including its header and metadata;
+    /// capture stops before a record that would exceed it.
+    ///
+    /// **Sensitive:** payloads include the initial connection's authentication
+    /// token and application data. Protect and delete the file appropriately.
+    /// On Unix it is created with mode 0600. Capture performs synchronous disk
+    /// I/O and an additional decompression, and can affect timing and memory.
+    /// Disk errors disable capture without disconnecting the client; a partial
+    /// trailing record is possible on an I/O error or process termination.
+    /// See `sdks/rust/BSATN_CAPTURE.md` for the format.
+    #[cfg(not(feature = "browser"))]
+    pub fn with_bsatn_capture(mut self, path: impl Into<PathBuf>, max_bytes: u64) -> Self {
+        self.payload_capture = Some((path.into(), max_bytes));
         self
     }
 

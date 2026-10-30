@@ -15,6 +15,8 @@ mod client_cache;
 mod compression;
 mod db_connection;
 mod metrics;
+#[cfg(not(feature = "browser"))]
+mod payload_capture;
 mod spacetime_module;
 #[cfg(feature = "streaming-decompression")]
 mod streaming_decompression;

@@ -90,7 +90,13 @@ impl SerializeBuffer {
         let mut writer = self.compressed.writer();
         writer.get_mut().put_u8(tag);
         write(&self.uncompressed[1..], &mut writer);
-        let compressed = writer.into_inner().freeze();
+        let compressed = writer.into_inner();
+        // Both buffers include their tag. Keep the original allocation if
+        // compression would not make the complete frame smaller.
+        if compressed.len() >= self.uncompressed.len() {
+            return Self { compressed, ..self }.uncompressed();
+        }
+        let compressed = compressed.freeze();
         let in_use = InUseSerializeBuffer::Compressed {
             uncompressed: self.uncompressed,
             compressed: compressed.clone(),
@@ -119,6 +125,69 @@ fn finalize_binary_serialize_buffer(
 }
 
 type BytesMutWriter<'a> = bytes::buf::Writer<&'a mut BytesMut>;
+
+#[cfg(test)]
+mod compression_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn compression_threshold_and_size_fallback() {
+        for (codec, tag) in [
+            (ws_v1::Compression::Brotli, ws_common::SERVER_MSG_COMPRESSION_TAG_BROTLI),
+            (ws_v1::Compression::Gzip, ws_common::SERVER_MSG_COMPRESSION_TAG_GZIP),
+        ] {
+            for size in [63, 64, 65, 1024, 1025] {
+                let mut state = 987654321u64;
+                let random: Vec<_> = (0..size)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state as u8
+                    })
+                    .collect();
+                for (payload, expected_tag) in [
+                    (
+                        vec![42; size],
+                        if size < 64 {
+                            ws_common::SERVER_MSG_COMPRESSION_TAG_NONE
+                        } else {
+                            tag
+                        },
+                    ),
+                    (random, ws_common::SERVER_MSG_COMPRESSION_TAG_NONE),
+                ] {
+                    let mut buffer = SerializeBuffer::new(ClientConfig::for_test());
+                    buffer.write_with_tag(ws_common::SERVER_MSG_COMPRESSION_TAG_NONE, |mut writer| {
+                        writer.write_all(&payload).unwrap();
+                    });
+                    let original = buffer.uncompressed.as_ptr();
+                    let (in_use, frame) = finalize_binary_serialize_buffer(buffer, size, codec);
+                    assert_eq!(frame[0], expected_tag);
+                    if expected_tag == ws_common::SERVER_MSG_COMPRESSION_TAG_NONE {
+                        assert_eq!(&frame[1..], payload);
+                        assert_eq!(frame.as_ptr(), original);
+                    } else {
+                        let mut decoded = Vec::new();
+                        if tag == ws_common::SERVER_MSG_COMPRESSION_TAG_BROTLI {
+                            brotli::Decompressor::new(&frame[1..], 4096)
+                                .read_to_end(&mut decoded)
+                                .unwrap();
+                        } else {
+                            flate2::read::GzDecoder::new(&frame[1..])
+                                .read_to_end(&mut decoded)
+                                .unwrap();
+                        }
+                        assert_eq!(decoded, payload);
+                    }
+                    drop(frame);
+                    assert!(in_use.try_reclaim().is_some());
+                }
+            }
+        }
+    }
+}
 
 pub enum InUseSerializeBuffer {
     Uncompressed { uncompressed: Bytes, compressed: BytesMut },

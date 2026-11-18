@@ -185,25 +185,33 @@ impl BuildableWebsocketFormat for ws_v1::BsatnFormat {
                 let bytes = bsatn::to_vec(&qu).unwrap();
                 let mut out = Vec::new();
                 brotli_compress(&bytes, &mut out);
-                ws_v1::CompressableQueryUpdate::Brotli(out.into())
+                // Include the BSATN length prefix for the compressed byte array.
+                if out.len().saturating_add(size_of::<u32>()) < qu_len_would_have_been {
+                    ws_v1::CompressableQueryUpdate::Brotli(out.into())
+                } else {
+                    ws_v1::CompressableQueryUpdate::Uncompressed(qu)
+                }
             }
             ws_v1::Compression::Gzip => {
                 let bytes = bsatn::to_vec(&qu).unwrap();
                 let mut out = Vec::new();
                 gzip_compress(&bytes, &mut out);
-                ws_v1::CompressableQueryUpdate::Gzip(out.into())
+                if out.len().saturating_add(size_of::<u32>()) < qu_len_would_have_been {
+                    ws_v1::CompressableQueryUpdate::Gzip(out.into())
+                } else {
+                    ws_v1::CompressableQueryUpdate::Uncompressed(qu)
+                }
             }
         }
     }
 }
 
 pub fn decide_compression(len: usize, compression: ws_v1::Compression) -> ws_v1::Compression {
-    /// The threshold beyond which we start to compress messages.
-    /// 1KiB was chosen without measurement.
-    /// TODO(perf): measure!
-    const COMPRESS_THRESHOLD: usize = 1024;
+    /// Small row updates can already benefit from compression. Keep the
+    /// compressed representation only if it saves bytes.
+    const MIN_COMPRESS_BYTES: usize = 64;
 
-    if len > COMPRESS_THRESHOLD {
+    if len >= MIN_COMPRESS_BYTES {
         compression
     } else {
         ws_v1::Compression::None

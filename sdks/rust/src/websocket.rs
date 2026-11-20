@@ -32,6 +32,31 @@ use tokio_websockets::{
     ClientBuilder, Connector, Limits, MaybeTlsStream, Message as WebSocketMessage, WebSocketStream,
 };
 
+#[cfg(all(not(feature = "browser"), not(feature = "tokio-websockets-rustls")))]
+type NativeSocket = tokio_util::either::Either<TcpStream, tokio::io::BufReader<TcpStream>>;
+#[cfg(all(not(feature = "browser"), feature = "tokio-websockets-rustls"))]
+type NativeSocket = TcpStream;
+#[cfg(not(feature = "browser"))]
+type NativeStream = MaybeTlsStream<NativeSocket>;
+
+#[cfg(all(not(feature = "browser"), not(feature = "tokio-websockets-rustls")))]
+fn wss_connector() -> Result<Connector, WebSocketError> {
+    Ok(Connector::NativeTls(native_tls::TlsConnector::new()?.into()))
+}
+
+#[cfg(all(not(feature = "browser"), feature = "tokio-websockets-rustls"))]
+fn wss_connector() -> Result<Connector, WebSocketError> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+    use tokio_rustls::rustls::{crypto::ring, ClientConfig};
+
+    // Select ring locally without changing the application's process-wide provider.
+    let config = ClientConfig::builder_with_provider(Arc::new(ring::default_provider()))
+        .with_safe_default_protocol_versions()?
+        .with_platform_verifier()?
+        .with_no_client_auth();
+    Ok(Connector::Rustls(Arc::new(config).into()))
+}
+
 #[cfg(not(feature = "streaming-decompression"))]
 use crate::compression::decompress_server_message;
 #[cfg(not(feature = "browser"))]
@@ -85,6 +110,95 @@ mod heartbeat_tests {
             assert_eq!(interval.tick().await, start + Duration::from_secs(tick * 30));
         }
     }
+}
+
+#[cfg(all(test, not(feature = "browser")))]
+#[tokio::test]
+async fn plaintext_transport_runs_the_sdk_message_loop() {
+    use tokio::{net::TcpListener, time::timeout};
+    use tokio_websockets::{Message, ServerBuilder};
+    use ws::common::{Compression, QuerySetId, SERVER_MSG_COMPRESSION_TAG_GZIP};
+    use ws::v2::{ClientMessage, InitialConnection, ServerMessage, Unsubscribe};
+
+    timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("ws://{}", listener.local_addr().unwrap()).parse().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let server = ServerBuilder::new()
+                .add_header(
+                    http::header::SEC_WEBSOCKET_PROTOCOL,
+                    http::HeaderValue::from_static(ws::v2::BIN_PROTOCOL),
+                )
+                .unwrap();
+            let (handshake, mut sock) = server.accept(stream).await.unwrap();
+            assert_eq!(
+                handshake.uri().path_and_query().unwrap().as_str(),
+                "/v1/database/test/subscribe?compression=Gzip"
+            );
+            assert_eq!(
+                handshake.headers()[http::header::SEC_WEBSOCKET_PROTOCOL],
+                ws::v2::BIN_PROTOCOL
+            );
+            assert!(!handshake.headers().contains_key(http::header::SEC_WEBSOCKET_EXTENSIONS));
+
+            let initial = ServerMessage::InitialConnection(InitialConnection {
+                identity: spacetimedb_lib::Identity::ZERO,
+                connection_id: ConnectionId::ZERO,
+                token: "test".into(),
+            });
+            let mut encoder =
+                flate2::write::GzEncoder::new(vec![SERVER_MSG_COMPRESSION_TAG_GZIP], flate2::Compression::fast());
+            encoder.write_all(&bsatn::to_vec(&initial).unwrap()).unwrap();
+            sock.send(Message::binary(encoder.finish().unwrap())).await.unwrap();
+            sock.send(Message::ping(Bytes::from_static(b"ping"))).await.unwrap();
+            let (mut got_request, mut got_pong) = (false, false);
+            while !(got_request && got_pong) {
+                match sock.next().await.unwrap().unwrap() {
+                    message if message.is_binary() => {
+                        assert!(matches!(
+                            bsatn::from_slice::<ClientMessage>(message.as_payload()).unwrap(),
+                            ClientMessage::Unsubscribe(Unsubscribe { request_id: 42, .. })
+                        ));
+                        got_request = true;
+                    }
+                    message if message.is_pong() => {
+                        assert_eq!(&message.as_payload()[..], b"ping");
+                        got_pong = true;
+                    }
+                    message => panic!("unexpected message: {message:?}"),
+                }
+            }
+        });
+        let connection = WsConnection::connect(
+            uri,
+            "test",
+            Some("test-token"),
+            None,
+            WsParams {
+                compression: Compression::Gzip,
+                confirmed: None,
+            },
+        )
+        .await
+        .unwrap();
+        let (task, mut incoming, outgoing) = connection.spawn_message_loop(&runtime::Handle::current(), None, None);
+        outgoing
+            .unbounded_send(ClientMessage::Unsubscribe(Unsubscribe {
+                request_id: 42,
+                query_set_id: QuerySetId::new(1),
+                flags: Default::default(),
+            }))
+            .unwrap();
+        assert!(matches!(
+            incoming.next().await,
+            Some(ServerMessage::InitialConnection(initial)) if &*initial.token == "test"
+        ));
+        server.await.unwrap();
+        task.await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[derive(Error, Debug, Clone)]
@@ -149,7 +263,7 @@ pub enum WsError {
 pub(crate) struct WsConnection {
     db_name: Box<str>,
     #[cfg(not(feature = "browser"))]
-    sock: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    sock: WebSocketStream<NativeStream>,
     #[cfg(feature = "browser")]
     sock: WebSocketStream,
 }
@@ -328,6 +442,20 @@ impl WsConnection {
         params: WsParams,
     ) -> Result<Self, WsError> {
         let uri = make_uri(host, db_name, connection_id, params)?;
+        let stream = Self::connect_native_stream(&uri).await?;
+        let sock = Self::upgrade_native_stream(uri, stream, token).await?;
+        Ok(WsConnection {
+            db_name: db_name.into(),
+            sock,
+        })
+    }
+
+    #[cfg(not(feature = "browser"))]
+    async fn upgrade_native_stream(
+        uri: Uri,
+        stream: NativeStream,
+        token: Option<&str>,
+    ) -> Result<WebSocketStream<NativeStream>, WsError> {
         // TODO(kim): In order to be able to replicate module WASM blobs,
         // `cloud-next` cannot have message / frame size limits. That's
         // obviously a bad default for all other clients, though.
@@ -350,7 +478,15 @@ impl WsConnection {
                     source: Arc::new(source),
                 })?;
         }
+        let (sock, _) = builder.connect_on(stream).await.map_err(|source| WsError::WebSocket {
+            uri,
+            source: Arc::new(source),
+        })?;
+        Ok(sock)
+    }
 
+    #[cfg(not(feature = "browser"))]
+    async fn connect_native_stream(uri: &Uri) -> Result<NativeStream, WsError> {
         // ClientBuilder's default resolver selects only the first DNS result.
         // Connect through Tokio so hosts with both IPv4 and IPv6 addresses retain
         // the SDK's previous fallback behavior.
@@ -368,29 +504,26 @@ impl WsConnection {
                 uri: uri.clone(),
                 source: Arc::new(source.into()),
             })?;
-        let connector = if uri.scheme_str() == Some("wss") {
-            Connector::new().map_err(|source| WsError::WebSocket {
+        let secure = uri.scheme_str() == Some("wss");
+        #[cfg(not(feature = "tokio-websockets-rustls"))]
+        let stream = if secure {
+            // Read ahead on ciphertext so OpenSSL's short record-header and
+            // payload reads can share a TCP read. Writes still pass through.
+            NativeSocket::Right(tokio::io::BufReader::with_capacity(16 * 1024, stream))
+        } else {
+            NativeSocket::Left(stream)
+        };
+        let connector = if secure {
+            wss_connector().map_err(|source| WsError::WebSocket {
                 uri: uri.clone(),
                 source: Arc::new(source),
             })?
         } else {
             Connector::Plain
         };
-        let stream = connector
-            .wrap(host, stream)
-            .await
-            .map_err(|source| WsError::WebSocket {
-                uri: uri.clone(),
-                source: Arc::new(source),
-            })?;
-        let (sock, _): (WebSocketStream<MaybeTlsStream<TcpStream>>, _) =
-            builder.connect_on(stream).await.map_err(|source| WsError::WebSocket {
-                uri,
-                source: Arc::new(source),
-            })?;
-        Ok(WsConnection {
-            db_name: db_name.into(),
-            sock,
+        connector.wrap(host, stream).await.map_err(|source| WsError::WebSocket {
+            uri: uri.clone(),
+            source: Arc::new(source),
         })
     }
 
@@ -548,8 +681,7 @@ impl WsConnection {
                         log::trace!("received ping");
                         idle = false;
                         record_metrics(message.as_payload().len());
-                        // No need to explicitly respond with a `Pong`,
-                        // as tokio-websockets handles this automatically.
+                        // tokio-websockets automatically replies with a Pong.
                     },
 
                     Ok(Some(message)) if message.is_pong() => {

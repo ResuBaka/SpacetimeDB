@@ -16,6 +16,8 @@ client-cache = ["dep:anymap3"]
 retain-row-bytes = []
 # Experimental owned decoder; intentionally not enabled by default.
 streaming-decompression = []
+# Opt into Rustls for native WSS; otherwise use buffered native TLS.
+tokio-websockets-rustls = ["dep:tokio-rustls", "dep:rustls-platform-verifier", "tokio-websockets/rustls-bring-your-own-connector"]
 allow_loopback_http_for_tests = ["spacetimedb-testing/allow_loopback_http_for_tests"]
 browser = [
     "dep:getrandom",
@@ -64,6 +66,10 @@ web-sys = { version = "0.3.77", features = ["HtmlDocument"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 home.workspace = true
+native-tls = "0.2"
+rustls-platform-verifier = { version = "0.7", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+tokio-util.workspace = true
 tokio.workspace = true
 tokio-websockets.workspace = true
 
@@ -76,6 +82,7 @@ tokio = { workspace = true, features = ["test-util"] }
 spacetimedb-testing = { path = "../../crates/testing" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+tokio-websockets = { workspace = true, features = ["server"] }
 # Native-only experimental benchmark; not linked into the SDK itself.
 zstd = "0.13.3"
 lz4_flex.workspace = true

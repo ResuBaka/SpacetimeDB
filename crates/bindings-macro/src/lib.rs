@@ -131,6 +131,7 @@ mod sym {
     symbol!(at);
     symbol!(auto_inc);
     symbol!(btree);
+    symbol!(bsatn_pod);
     symbol!(client_connected);
     symbol!(client_disconnected);
     symbol!(column);

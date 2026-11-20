@@ -10,7 +10,7 @@ use lean_string::{LeanString, ToLeanString};
 pub struct RawIdentifier(pub(crate) LeanString);
 
 impl_st!([] RawIdentifier, _ts => AlgebraicType::String);
-impl_serialize!([] RawIdentifier, (self, ser) => ser.serialize_str(&self.0));
+impl_serialize!([] RawIdentifier, (self, ser) => ser.serialize_str(&self.0), self => self.0.bsatn_size_hint());
 impl_deserialize!([] RawIdentifier, de => LeanString::deserialize(de).map(Self));
 impl RawIdentifier {
     /// Creates a new `RawIdentifier` from a string.

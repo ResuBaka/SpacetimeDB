@@ -79,6 +79,22 @@ pub trait BufWriter {
     /// All other methods are provided.
     fn put_slice(&mut self, slice: &[u8]);
 
+    /// Write a BSATN element count and its contiguous payload.
+    fn put_len_prefixed_slice(&mut self, count: u32, payload: &[u8]) {
+        self.put_u32(count);
+        self.put_slice(payload);
+    }
+
+    /// Append fixed-width wire blocks, without a count prefix.
+    fn put_fixed_rows<T, const N: usize>(&mut self, rows: &[T], pack: impl Fn(&T) -> [u8; N])
+    where
+        Self: Sized,
+    {
+        for row in rows {
+            self.put_slice(&pack(row));
+        }
+    }
+
     /// Writes a `u8` to the buffer in little-endian (LE) encoding.
     fn put_u8(&mut self, val: u8) {
         self.put_slice(&val.to_le_bytes())
@@ -299,6 +315,24 @@ pub trait BufReader<'de> {
 }
 
 impl BufWriter for Vec<u8> {
+    #[inline]
+    fn put_fixed_rows<T, const N: usize>(&mut self, rows: &[T], pack: impl Fn(&T) -> [u8; N]) {
+        append_fixed_rows(self, rows, pack);
+    }
+    #[inline]
+    fn put_len_prefixed_slice(&mut self, count: u32, payload: &[u8]) {
+        let len = size_of::<u32>() + payload.len();
+        // `to_vec` starts empty: allocate the complete field directly. When
+        // appending to an existing buffer, keep Vec's amortized growth.
+        if self.capacity() == 0 {
+            *self = Vec::with_capacity(len);
+        } else {
+            self.reserve(len);
+        }
+        self.extend_from_slice(&count.to_le_bytes());
+        self.extend_from_slice(payload);
+    }
+
     fn put_slice(&mut self, slice: &[u8]) {
         self.extend_from_slice(slice);
     }
@@ -316,8 +350,35 @@ impl BufWriter for &mut [u8] {
 }
 
 impl BufWriter for BytesMut {
+    fn put_fixed_rows<T, const N: usize>(&mut self, rows: &[T], pack: impl Fn(&T) -> [u8; N]) {
+        append_fixed_rows(self, rows, pack);
+    }
     fn put_slice(&mut self, slice: &[u8]) {
         BufMut::put_slice(self, slice);
+    }
+}
+
+/// Fill the final allocation directly. In particular, don't zero-fill the
+/// payload or allocate a temporary output vector before overwriting it.
+#[inline]
+fn append_fixed_rows<T, const N: usize>(
+    buf: &mut impl crate::bsatn::BufReservedFill,
+    rows: &[T],
+    pack: impl Fn(&T) -> [u8; N],
+) {
+    if N == 0 {
+        return;
+    }
+    let len = rows.len().checked_mul(N).expect("wire length overflow");
+    // SAFETY: there are exactly rows.len() slots of N bytes in dst. Each
+    // iteration initializes its whole slot. If pack panics, reserve_and_fill
+    // never publishes the new length.
+    unsafe {
+        buf.reserve_and_fill(len, |dst| {
+            for (slot, row) in dst.as_chunks_mut::<N>().0.iter_mut().zip(rows) {
+                slot.write_copy_of_slice(&pack(row));
+            }
+        });
     }
 }
 
@@ -344,6 +405,13 @@ impl CountWriter {
 }
 
 impl BufWriter for CountWriter {
+    fn put_fixed_rows<T, const N: usize>(&mut self, rows: &[T], _: impl Fn(&T) -> [u8; N]) {
+        self.num_bytes = rows
+            .len()
+            .checked_mul(N)
+            .and_then(|n| self.num_bytes.checked_add(n))
+            .expect("wire length overflow");
+    }
     fn put_slice(&mut self, slice: &[u8]) {
         self.num_bytes += slice.len();
     }

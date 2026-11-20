@@ -162,6 +162,59 @@ fn variable_row_offsets_and_event_rows() {
 }
 
 #[test]
+fn row_offsets_cross_refills_and_do_not_consume_the_row_payload() {
+    use spacetimedb_sdk::unstable::streaming_decompression::from_reader;
+    use std::io::{self, Read};
+
+    struct ShortReads<'a>(&'a [u8], usize);
+    impl Read for ShortReads<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let n = self.1.min(out.len());
+            self.0.read(&mut out[..n])
+        }
+    }
+
+    // More than a 16 KiB decompression buffer, with unaligned 8-byte words.
+    let offsets = (0..2307).map(|i| i * 3_u64).collect::<Vec<_>>();
+    let encoded_offsets = bsatn::to_vec(&offsets).unwrap();
+    let msg = ServerMessage::SubscribeApplied(SubscribeApplied {
+        request_id: 13,
+        query_set_id: QuerySetId::new(7),
+        rows: QueryRows {
+            tables: vec![SingleTableRows {
+                table: "rows".into(),
+                rows: BsatnRowList::new(RowSizeHint::RowOffsets(offsets.into()), vec![0xa7; 2307 * 3].into()),
+            }]
+            .into(),
+        },
+    });
+    let raw = bsatn::to_vec(&msg).unwrap();
+    for chunk in [1, 7, 8, 17, 16384] {
+        let decoded = from_reader(ShortReads(&raw, chunk), "test").unwrap();
+        assert_eq!(bsatn::to_vec(&decoded).unwrap(), raw);
+    }
+    for tag in 0..=2 {
+        let decoded = streaming(&fixture::compress(&raw, tag)).unwrap();
+        assert_eq!(bsatn::to_vec(&decoded).unwrap(), raw);
+    }
+
+    let count_pos = raw
+        .windows(encoded_offsets.len())
+        .position(|w| w == encoded_offsets)
+        .unwrap();
+    // End inside the last word; neither decoder may accept incomplete offsets.
+    let truncated = &raw[..count_pos + encoded_offsets.len() - 1];
+    assert!(bsatn::from_slice::<ServerMessage>(truncated).is_err());
+    assert!(from_reader(truncated, "test").is_err());
+    // A huge count with only one offset available must not trigger an allocation
+    // proportional to the count before reporting truncation.
+    let mut bad = raw[..count_pos + 4 + 8].to_vec();
+    bad[count_pos..count_pos + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(bsatn::from_slice::<ServerMessage>(&bad).is_err());
+    assert!(from_reader(&bad[..], "test").is_err());
+}
+
+#[test]
 fn connection_reducer_and_procedure_messages() {
     use spacetimedb_sdk::{ConnectionId, Identity, TimeDuration, Timestamp};
     let mut messages = vec![ServerMessage::InitialConnection(InitialConnection {

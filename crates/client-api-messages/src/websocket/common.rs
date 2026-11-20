@@ -149,6 +149,15 @@ impl BsatnRowList {
         Some(self.rows_data.slice(data_range))
     }
 
+    /// Iterate in wire order without acquiring a shared `Bytes` handle for
+    /// each row. Use this when the consumer only needs the row during decoding.
+    pub fn iter_slices(&self) -> impl Iterator<Item = &[u8]> {
+        (0..).map_while(|index| {
+            let range = self.size_hint.index_to_range(index, self.rows_data.len())?;
+            Some(&self.rows_data[range])
+        })
+    }
+
     /// Consumes the list and returns the parts.
     pub fn into_inner(self) -> (RowSizeHint, Bytes) {
         (self.size_hint, self.rows_data)

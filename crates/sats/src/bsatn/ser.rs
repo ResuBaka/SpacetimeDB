@@ -31,6 +31,19 @@ impl<W: BufWriter> Serializer<'_, W> {
     pub fn raw_write_bytes(self, bytes: &[u8]) {
         self.writer.put_slice(bytes);
     }
+
+    /// Write the next field of a derived BSATN product.
+    #[inline]
+    #[doc(hidden)]
+    pub fn field<T: super::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), BsatnError> {
+        value.serialize_into_bsatn(self.reborrow())
+    }
+
+    #[inline]
+    #[doc(hidden)]
+    pub fn write_field_bytes(&mut self, bytes: &[u8]) {
+        self.writer.put_slice(bytes);
+    }
 }
 
 /// An error during BSATN serialization.
@@ -55,13 +68,9 @@ impl Error for BsatnError {
     }
 }
 
-/// Writes `len` converted to a `u32` to `writer`.
-///
-/// Errors if `len` would not fit in a `u32`.
-fn put_len(writer: &mut impl BufWriter, len: usize) -> Result<(), BsatnError> {
-    let len = len.try_into().map_err(|_| BsatnError::custom("len too long"))?;
-    writer.put_u32(len);
-    Ok(())
+/// BSATN length prefixes count elements, not payload bytes.
+fn wire_len(len: usize) -> Result<u32, BsatnError> {
+    len.try_into().map_err(|_| BsatnError::custom("len too long"))
 }
 
 impl<W: BufWriter> ser::Serializer for Serializer<'_, W> {
@@ -135,13 +144,27 @@ impl<W: BufWriter> ser::Serializer for Serializer<'_, W> {
         self.serialize_bytes(v.as_bytes())
     }
     fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
-        put_len(self.writer, v.len())?; // N.B. `v.len() > u32::MAX` isn't allowed.
-        self.writer.put_slice(v);
+        self.writer.put_len_prefixed_slice(wire_len(v.len())?, v);
         Ok(())
     }
     fn serialize_array(self, len: usize) -> Result<Self::SerializeArray, Self::Error> {
-        put_len(self.writer, len)?; // N.B. `len > u32::MAX` isn't allowed.
+        self.writer.put_u32(wire_len(len)?);
         Ok(self)
+    }
+    #[inline]
+    fn serialize_packed_array<T: super::Serialize>(self, values: &[T], payload: &[u8]) -> Result<(), Self::Error> {
+        self.writer.put_len_prefixed_slice(wire_len(values.len())?, payload);
+        Ok(())
+    }
+    #[inline]
+    fn serialize_fixed_array<T: super::Serialize, const N: usize>(
+        self,
+        values: &[T],
+        pack: impl Fn(&T) -> [u8; N],
+    ) -> Result<(), Self::Error> {
+        self.writer.put_u32(wire_len(values.len())?);
+        self.writer.put_fixed_rows(values, pack);
+        Ok(())
     }
     fn serialize_seq_product(self, _len: usize) -> Result<Self::SerializeSeqProduct, Self::Error> {
         Ok(self)
@@ -157,7 +180,7 @@ impl<W: BufWriter> ser::Serializer for Serializer<'_, W> {
         value: &T,
     ) -> Result<Self::Ok, Self::Error> {
         self.writer.put_u8(tag);
-        value.serialize(self)
+        value.serialize_into_bsatn(self)
     }
 
     unsafe fn serialize_bsatn<Ty>(self, ty: &Ty, bsatn: &[u8]) -> Result<Self::Ok, Self::Error>
@@ -196,7 +219,7 @@ impl<W: BufWriter> ser::Serializer for Serializer<'_, W> {
         debug_assert!(String::from_utf8(concat_bytes_slow(total_len, string.clone())).is_ok());
 
         // We need to len-prefix to make this BSATN.
-        put_len(self.writer, total_len)?;
+        self.writer.put_u32(wire_len(total_len)?);
 
         for chunk in string {
             self.writer.put_slice(chunk);
@@ -220,7 +243,7 @@ impl<W: BufWriter> SerializeArray for Serializer<'_, W> {
     type Error = BsatnError;
 
     fn serialize_element<T: super::Serialize + ?Sized>(&mut self, elem: &T) -> Result<(), Self::Error> {
-        elem.serialize(self.reborrow())
+        elem.serialize_into_bsatn(self.reborrow())
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
@@ -233,7 +256,7 @@ impl<W: BufWriter> SerializeSeqProduct for Serializer<'_, W> {
     type Error = BsatnError;
 
     fn serialize_element<T: super::Serialize + ?Sized>(&mut self, elem: &T) -> Result<(), Self::Error> {
-        elem.serialize(self.reborrow())
+        elem.serialize_into_bsatn(self.reborrow())
     }
     fn end(self) -> Result<Self::Ok, Self::Error> {
         Ok(())

@@ -103,6 +103,31 @@ pub trait Serializer: Sized {
     /// The argument is the number of elements in the sequence.
     fn serialize_array(self, len: usize) -> Result<Self::SerializeArray, Self::Error>;
 
+    /// Serialize the elements of a slice individually.
+    fn serialize_slice<T: Serialize>(self, values: &[T]) -> Result<Self::Ok, Self::Error> {
+        let mut array = self.serialize_array(values.len())?;
+        for value in values {
+            array.serialize_element(value)?;
+        }
+        array.end()
+    }
+
+    /// Serialize `values` with their concatenated BSATN encodings (without a length prefix)
+    /// already available in `payload`. Other formats serialize the original elements.
+    fn serialize_packed_array<T: Serialize>(self, values: &[T], _payload: &[u8]) -> Result<Self::Ok, Self::Error> {
+        self.serialize_slice(values)
+    }
+
+    /// Like a packed array, but build each wire block without assuming native layout.
+    #[doc(hidden)]
+    fn serialize_fixed_array<T: Serialize, const N: usize>(
+        self,
+        values: &[T],
+        _pack: impl Fn(&T) -> [u8; N],
+    ) -> Result<Self::Ok, Self::Error> {
+        self.serialize_slice(values)
+    }
+
     /// Begin to serialize a product with unnamed fields.
     /// This call must be followed by zero or more calls to [`SerializeSeqProduct::serialize_element`],
     /// then a call to [`SerializeSeqProduct::end`].
@@ -285,6 +310,23 @@ pub trait Serialize {
     /// Serialize `self` in the data format of `S` using the provided `serializer`.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error>;
 
+    /// BSATN bytes per element when independent of its value (not its native layout).
+    #[doc(hidden)]
+    const BSATN_FIXED_SIZE: Option<usize> = None;
+
+    /// Return the BSATN size if cheaply known, without serializing or scanning long collections.
+    /// Used only for initial buffer capacity; `None` uses normal amortized growth.
+    #[doc(hidden)]
+    fn bsatn_size_hint(&self) -> Option<usize> {
+        Self::BSATN_FIXED_SIZE
+    }
+
+    /// A fixed-size value can return a copy of its complete wire block directly.
+    #[doc(hidden)]
+    fn __bsatn_vec(&self) -> Option<Vec<u8>> {
+        None
+    }
+
     #[doc(hidden)]
     /// Serialize `self` in the data format BSATN using the provided BSATN `serializer`.
     fn serialize_into_bsatn<W: BufWriter>(
@@ -302,11 +344,7 @@ pub trait Serialize {
     where
         Self: Sized,
     {
-        let mut vec = serializer.serialize_array(this.len())?;
-        for elem in this {
-            vec.serialize_element(elem)?;
-        }
-        vec.end()
+        serializer.serialize_slice(this)
     }
 }
 

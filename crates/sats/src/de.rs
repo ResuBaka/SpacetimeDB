@@ -33,6 +33,11 @@ pub trait Deserializer<'de>: Sized {
     /// The error type that can be returned if some error occurs during deserialization.
     type Error: Error;
 
+    /// Decode a typed value, allowing the format to select its specialized decoder.
+    fn deserialize_value<T: Deserialize<'de>>(self) -> Result<T, Self::Error> {
+        T::deserialize(self)
+    }
+
     /// Deserializes a product value from the input.
     fn deserialize_product<V: ProductVisitor<'de>>(self, visitor: V) -> Result<V::Output, Self::Error>;
 
@@ -122,6 +127,33 @@ pub trait Deserializer<'de>: Sized {
 
     /// Deserializes a `u64` value from the input.
     fn deserialize_u64(self) -> Result<u64, Self::Error>;
+
+    /// Deserializes an owned array of `u64`s. Binary formats can read these
+    /// in blocks (e.g. the offsets in a variable-size BSATN row list).
+    #[inline(always)]
+    fn deserialize_u64_vec(self) -> Result<Vec<u64>, Self::Error> {
+        self.deserialize_fixed_vec(u64::from_le_bytes)
+    }
+
+    /// Decode a sequence of typed elements into a vector.
+    fn deserialize_vec<T: Deserialize<'de>>(self) -> Result<Vec<T>, Self::Error> {
+        self.deserialize_array(BasicVecVisitor)
+    }
+
+    /// Deserialize an owned array whose elements each occupy `N` BSATN bytes.
+    /// `decode` converts one complete element, without assuming input alignment.
+    fn deserialize_fixed_vec<T: Deserialize<'de>, const N: usize>(
+        self,
+        _decode: impl Fn([u8; N]) -> T,
+    ) -> Result<Vec<T>, Self::Error> {
+        self.deserialize_array(BasicVecVisitor)
+    }
+
+    /// Decode rows whose native byte representation is their wire representation.
+    #[doc(hidden)]
+    fn deserialize_pod_vec<T: Deserialize<'de> + bytemuck::Pod>(self) -> Result<Vec<T>, Self::Error> {
+        self.deserialize_array(BasicVecVisitor)
+    }
 
     /// Deserializes a `u128` value from the input.
     fn deserialize_u128(self) -> Result<u128, Self::Error>;
@@ -685,8 +717,9 @@ pub trait Deserialize<'de>: Sized {
 
     #[doc(hidden)]
     /// Deserialize this value from the given the BSATN `deserializer`.
+    #[inline(always)]
     fn deserialize_from_bsatn<R: BufReader<'de>>(
-        deserializer: bsatn::Deserializer<'de, R>,
+        deserializer: bsatn::Deserializer<'_, R>,
     ) -> Result<Self, bsatn::DecodeError> {
         Self::deserialize(deserializer)
     }
@@ -695,7 +728,7 @@ pub trait Deserialize<'de>: Sized {
     #[doc(hidden)]
     #[inline(always)]
     fn __deserialize_vec<D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Self>, D::Error> {
-        deserializer.deserialize_array(BasicVecVisitor)
+        deserializer.deserialize_vec()
     }
 
     #[doc(hidden)]
@@ -726,7 +759,7 @@ impl<'de, T: Deserialize<'de>> DeserializeSeed<'de> for PhantomData<T> {
     type Output = T;
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Output, D::Error> {
-        T::deserialize(deserializer)
+        deserializer.deserialize_value()
     }
 }
 
@@ -769,12 +802,14 @@ impl<T, const N: usize> GrowingVec<T> for SmallVec<[T; N]> {
     }
 }
 
+/// Initial reservation limit for a count not yet checked against a complete payload.
+pub(crate) const RESERVE_ARRAY_ELEMENTS: usize = 4096;
+
 /// A basic implementation of `ArrayVisitor::visit` using the provided size hint.
 pub fn array_visit<'de, A: ArrayAccess<'de>, V: GrowingVec<A::Element>>(mut access: A) -> Result<V, A::Error> {
     // Don’t blindly trust length prefixes when reserving initial capacity
     // for decoding array elements, as malformed input could generate a huge allocation,
     // potentially resulting in an OOM kill.
-    const RESERVE_ARRAY_ELEMENTS: usize = 4096;
     let cap = access.size_hint().unwrap_or(0);
     let mut v = V::try_with_capacity(cap.min(RESERVE_ARRAY_ELEMENTS))?;
     while let Some(x) = access.next_element()? {

@@ -340,28 +340,26 @@ impl<Row: DeserializeOwned + Debug> TableUpdate<Row> {
 
     fn parse_from_row_list(sink: &mut Vec<WithBsatn<Row>>, raw_rows: &ws::common::BsatnRowList) -> crate::Result<()> {
         sink.reserve(raw_rows.len());
-        for raw_row in raw_rows {
-            sink.push(Self::parse_row(raw_row)?);
+        #[cfg(any(feature = "client-cache", feature = "retain-row-bytes"))]
+        for bsatn in raw_rows {
+            let row = Self::decode_row(&bsatn)?;
+            sink.push(WithBsatn { row, bsatn });
+        }
+        #[cfg(not(any(feature = "client-cache", feature = "retain-row-bytes")))]
+        for bytes in raw_rows.iter_slices() {
+            sink.push(WithBsatn {
+                row: Self::decode_row(bytes)?,
+                bsatn: Bytes::new(),
+            });
         }
         Ok(())
     }
 
-    fn parse_row(bytes: Bytes) -> crate::Result<WithBsatn<Row>> {
-        let parsed = bsatn::from_slice::<Row>(&bytes).map_err(|source| {
-            InternalError::failed_parse(std::any::type_name::<Row>(), "row data").with_cause(source)
-        })?;
-        // DeserializeOwned guarantees the decoded row cannot borrow the input.
-        // In cacheless mode neither callback delivery nor PK update matching
-        // needs BSATN. Keeping these slices would pin whole packed row buffers
-        // until the typed update (and any SDK queue holding it) is dropped.
-        #[cfg(not(any(feature = "client-cache", feature = "retain-row-bytes")))]
-        let bytes = {
-            drop(bytes);
-            Bytes::new()
-        };
-        Ok(WithBsatn {
-            bsatn: bytes,
-            row: parsed,
+    fn decode_row(bytes: &[u8]) -> crate::Result<Row> {
+        bsatn::from_slice::<Row>(bytes).map_err(|source| {
+            InternalError::failed_parse(std::any::type_name::<Row>(), "row data")
+                .with_cause(source)
+                .into()
         })
     }
 }
@@ -594,6 +592,28 @@ mod row_byte_retention_tests {
     }
 
     #[test]
+    fn variable_size_rows_preserve_wire_order_and_byte_policy() {
+        let expected = ["last by name", "", "first by name", "🦀"];
+        let mut data = Vec::new();
+        let mut offsets = Vec::new();
+        for row in expected {
+            offsets.push(data.len() as u64);
+            data.extend(bsatn::to_vec(row).unwrap());
+        }
+        let raw = BsatnRowList::new(RowSizeHint::RowOffsets(offsets.into()), data.into());
+        let parsed = parse_row_list_as_inserts::<String>(raw).unwrap();
+        for (row, expected) in parsed.inserts.iter().zip(expected) {
+            assert_eq!(row.row, expected);
+            if cfg!(any(feature = "client-cache", feature = "retain-row-bytes")) {
+                assert_eq!(row.bsatn.as_ref(), bsatn::to_vec(expected).unwrap());
+            } else {
+                assert!(row.bsatn.is_empty());
+            }
+        }
+        assert_eq!(parsed.inserts.len(), expected.len());
+    }
+
+    #[test]
     fn persistent_and_event_parsing_preserve_values_without_pinning_bytes() {
         let inserts = Arc::new(AtomicUsize::new(0));
         let deletes = Arc::new(AtomicUsize::new(0));
@@ -635,7 +655,8 @@ mod row_byte_retention_tests {
             data: vec![1, 2],
             drops: Arc::clone(&drops),
         });
-        assert!(TableUpdate::<u32>::parse_row(bytes).is_err());
+        let rows = BsatnRowList::new(RowSizeHint::RowOffsets([0].into()), bytes);
+        assert!(parse_row_list_as_inserts::<u32>(rows).is_err());
         assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
@@ -647,7 +668,12 @@ mod row_byte_retention_tests {
             data: bsatn::to_vec(&value).unwrap(),
             drops: Arc::clone(&drops),
         });
-        let parsed = TableUpdate::<(String, Vec<u32>)>::parse_row(bytes).unwrap();
+        let rows = BsatnRowList::new(RowSizeHint::RowOffsets([0].into()), bytes);
+        let parsed = parse_row_list_as_inserts::<(String, Vec<u32>)>(rows)
+            .unwrap()
+            .inserts
+            .pop()
+            .unwrap();
         assert_eq!(parsed.row, value);
         if cfg!(any(feature = "client-cache", feature = "retain-row-bytes")) {
             assert_eq!(drops.load(Ordering::Relaxed), 0);

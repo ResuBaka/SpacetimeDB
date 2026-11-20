@@ -25,6 +25,7 @@ pub(crate) struct SatsType<'a> {
     pub data: SatsTypeData<'a>,
     /// Was the type marked as `#[repr(C)]`?
     pub is_repr_c: bool,
+    pub bsatn_pod: bool,
 }
 
 pub(crate) enum SatsTypeData<'a> {
@@ -104,12 +105,17 @@ pub(crate) fn extract_sats_type<'a>(
 ) -> syn::Result<SatsType<'a>> {
     let mut name = None;
     let mut krate = None;
+    let mut bsatn_pod = None;
     for attr in attrs {
         if attr.path() != sym::sats {
             continue;
         }
         attr.parse_nested_meta(|meta| {
             match_meta!(match meta {
+                sym::bsatn_pod => {
+                    check_duplicate(&bsatn_pod, &meta)?;
+                    bsatn_pod = Some(meta.path.span());
+                }
                 sym::crate_ => {
                     check_duplicate(&krate, &meta)?;
                     let value = meta.value()?;
@@ -131,7 +137,7 @@ pub(crate) fn extract_sats_type<'a>(
 
     let is_repr_c = is_repr_c(attrs);
 
-    Ok(SatsType {
+    let ty = SatsType {
         ident,
         generics,
         name,
@@ -139,7 +145,17 @@ pub(crate) fn extract_sats_type<'a>(
         original_attrs: attrs,
         data,
         is_repr_c,
-    })
+        bsatn_pod: bsatn_pod.is_some(),
+    };
+    if let Some(span) = bsatn_pod
+        && extract_repr_c_primitive(&ty).is_none()
+    {
+        return Err(syn::Error::new(
+            span,
+            "bsatn_pod requires a nonempty repr(C) product of fixed-width numeric primitives",
+        ));
+    }
+    Ok(ty)
 }
 
 pub(crate) fn derive_satstype(ty: &SatsType<'_>) -> TokenStream {
@@ -301,31 +317,131 @@ fn extract_repr_c_primitive<'a>(ty: &'a SatsType) -> Option<Vec<&'a syn::Ident>>
         return None;
     };
 
-    // Ensure every field is a primitive and collect the idents.
-    const PRIM_TY: &[sym::Symbol] = &[
-        sym::u8,
-        sym::i8,
-        sym::u16,
-        sym::i16,
-        sym::u32,
-        sym::i32,
-        sym::u64,
-        sym::i64,
-        sym::u128,
-        sym::i128,
-        sym::f32,
-        sym::f64,
-    ];
-    let mut field_tys = Vec::with_capacity(fields.len());
-    for field in fields {
-        if let syn::Type::Path(ty) = &field.ty {
-            let ident = ty.path.get_ident().filter(|ident| PRIM_TY.iter().any(|p| ident == p))?;
-            field_tys.push(ident);
-        } else {
-            return None;
-        }
+    if fields.is_empty() {
+        return None;
     }
-    Some(field_tys)
+    fields.iter().map(|f| wire_scalar(f).map(|(ident, _)| ident)).collect()
+}
+
+/// The wire width and the compile-time proof that a row can be copied verbatim.
+fn packed_bsatn_layout(ty: &SatsType) -> Option<(TokenStream, TokenStream)> {
+    let fields = extract_repr_c_primitive(ty)?;
+    let krate = &ty.krate;
+    let width = quote! { #(core::mem::size_of::<#fields>())+* };
+    let can_copy = quote! { const {
+        #(#krate::bsatn::assert_is_primitive_type::<#fields>();)*
+        cfg!(target_endian = "little") && core::mem::size_of::<Self>() == #width
+    } };
+    Some((width, can_copy))
+}
+
+/// Only scalars for which every bit pattern is a valid value.
+fn wire_scalar<'a>(field: &SatsField<'a>) -> Option<(&'a syn::Ident, usize)> {
+    const SCALARS: &[(sym::Symbol, usize)] = &[
+        (sym::u8, 1),
+        (sym::i8, 1),
+        (sym::u16, 2),
+        (sym::i16, 2),
+        (sym::u32, 4),
+        (sym::i32, 4),
+        (sym::f32, 4),
+        (sym::u64, 8),
+        (sym::i64, 8),
+        (sym::f64, 8),
+        (sym::u128, 16),
+        (sym::i128, 16),
+    ];
+    let syn::Type::Path(path) = field.ty else { return None };
+    if path.qself.is_some() {
+        return None;
+    }
+    let ident = path.path.get_ident()?;
+    let (_, width) = SCALARS.iter().find(|(symbol, _)| ident == symbol)?;
+    Some((ident, *width))
+}
+
+fn scalar_check(scalars: &[&syn::Ident]) -> TokenStream {
+    quote! { true #(&& ::core::any::TypeId::of::<#scalars>() == ::core::any::TypeId::of::<::core::primitive::#scalars>())* }
+}
+
+const MAX_SCALAR_BLOCK: usize = 128;
+
+/// A complete product small enough for one stack-resident wire block.
+fn scalar_row(ty: &SatsType, fields: &[SatsField<'_>]) -> Option<(usize, TokenStream)> {
+    if !ty.generics.params.is_empty() || fields.is_empty() {
+        return None;
+    }
+    let scalars = fields.iter().map(wire_scalar).collect::<Option<Vec<_>>>()?;
+    let (types, widths): (Vec<_>, Vec<_>) = scalars.into_iter().unzip();
+    let width = widths.iter().sum();
+    (width <= MAX_SCALAR_BLOCK).then(|| (width, scalar_check(&types)))
+}
+
+/// Coalesce consecutive scalar fields into one checked span or one write. This
+/// doesn't depend on Rust layout. The type checks fold away for concrete types
+/// and keep the ordinary field codec if an identifier shadows a primitive.
+fn bsatn_product_fields(ty: &SatsType, fields: &[SatsField<'_>], reading: bool) -> TokenStream {
+    let krate = &ty.krate;
+    let names: Vec<_> = fields.iter().map(|f| f.ident.unwrap()).collect();
+    let slots: Vec<_> = (0..fields.len()).map(|i| quote::format_ident!("__field_{i}")).collect();
+    let mut body = TokenStream::new();
+    let mut i = 0;
+    while i < fields.len() {
+        let mut scalars = Vec::new();
+        let mut width = 0usize;
+        if ty.generics.params.is_empty() {
+            for (ident, n) in fields[i..].iter().map_while(wire_scalar) {
+                if width + n > MAX_SCALAR_BLOCK {
+                    break;
+                }
+                scalars.push(ident);
+                width += n;
+            }
+        }
+        if scalars.len() < 2 {
+            let (slot, name) = (&slots[i], names[i]);
+            body.extend(if reading {
+                quote!(let #slot = __de.field()?;)
+            } else {
+                quote!(__ser.field(&self.#name)?;)
+            });
+            i += 1;
+            continue;
+        }
+        let end = i + scalars.len();
+        let names = &names[i..end];
+        let slots = &slots[i..end];
+        let check = scalar_check(&scalars);
+        body.extend(if reading {
+            quote! {
+                let __span = if #check { __de.try_get_array::<#width>() } else { None };
+                let (#(#slots,)*) = if let Some(__span) = __span {
+                    let mut __src = __span.as_slice();
+                    (#(#krate::bsatn::from_reader::<#scalars>(&mut __src)?,)*)
+                } else {
+                    (#(__de.field::<#scalars>()?,)*)
+                };
+            }
+        } else {
+            quote! {
+                if #check {
+                    let mut __bytes = [0u8; #width];
+                    let mut __dst = __bytes.as_mut_slice();
+                    #(#krate::bsatn::to_writer(&mut __dst, &self.#names)?;)*
+                    __ser.write_field_bytes(&__bytes);
+                } else {
+                    #(__ser.field(&self.#names)?;)*
+                }
+            }
+        });
+        i = end;
+    }
+    body.extend(if reading {
+        quote!(Ok(Self { #(#names: #slots,)* }))
+    } else {
+        quote!(Ok(()))
+    });
+    body
 }
 
 pub(crate) fn derive_deserialize(ty: &SatsType<'_>) -> TokenStream {
@@ -358,32 +474,73 @@ pub(crate) fn derive_deserialize(ty: &SatsType<'_>) -> TokenStream {
 
     match &ty.data {
         SatsTypeData::Product(fields) => {
-            let mut fast_body = None;
-            if let Some(fields) = extract_repr_c_primitive(ty) {
-                fast_body = Some(quote! {
+            let fast_body = if let Some(types) = extract_repr_c_primitive(ty) {
+                let width = quote! { #(core::mem::size_of::<#types>())+* };
+                let names = fields.iter().map(|f| f.ident.unwrap());
+                // Read one checked wire span; neither input alignment nor Rust struct padding matters.
+                let read = quote! {{
+                    const { #(#spacetimedb_lib::bsatn::assert_is_primitive_type::<#types>();)* }
+                    let mut __end = 0;
+                    Self { #(#names: {
+                        let __start = __end;
+                        __end += core::mem::size_of::<#types>();
+                        #types::from_le_bytes(::core::convert::TryInto::try_into(&__bytes[__start..__end]).unwrap())
+                    },)* }
+                }};
+                let decode_vec = if ty.bsatn_pod {
+                    quote! {
+                        if cfg!(target_endian = "little") {
+                            return de.deserialize_pod_vec::<Self>();
+                        }
+                    }
+                } else {
+                    TokenStream::new()
+                };
+                quote! {
                     #[inline(always)]
                     fn deserialize_from_bsatn<R: #spacetimedb_lib::buffer::BufReader<'de>>(
-                        mut deserializer: #spacetimedb_lib::bsatn::Deserializer<'de, R>
+                        mut deserializer: #spacetimedb_lib::bsatn::Deserializer<'_, R>
                     ) -> Result<Self, #spacetimedb_lib::bsatn::DecodeError> {
-                        const _: () = {
-                            #(#spacetimedb_lib::bsatn::assert_is_primitive_type::<#fields>();)*
-                        };
-                        // This guarantees that `Self` has no padding.
-                        if const { core::mem::size_of::<Self>() == #(core::mem::size_of::<#fields>())+* } {
-                            let bytes = deserializer.get_slice(core::mem::size_of::<Self>())?;
-                            let ptr = bytes as *const [u8] as *const u8 as *const Self;
-                            // SAFETY:
-                            // - `ptr` is valid for reads, `size_of::<T>()`.
-                            // - `ptr` is trivially properly aligned (alignment = 1).
-                            // - `ptr` points to a properly initialized `Foo`
-                            //   as we've guaranteed that there is no padding.
-                            Ok(unsafe { core::ptr::read(ptr) })
-                        } else {
-                            Self::deserialize(deserializer)
+                        let __bytes = deserializer.get_array::<{ #width }>()?;
+                        Ok(#read)
+                    }
+
+                    #[inline(always)]
+                    fn __deserialize_vec<D: #spacetimedb_lib::de::Deserializer<'de>>(de: D) -> Result<::std::vec::Vec<Self>, D::Error> {
+                        #decode_vec
+                        de.deserialize_fixed_vec(|__bytes: [u8; #width]| #read)
+                    }
+                }
+            } else {
+                let read = bsatn_product_fields(ty, fields, true);
+                let bulk = scalar_row(ty, fields).map(|(width, check)| {
+                    let names = fields.iter().map(|f| f.ident.unwrap());
+                    // Each numeric field accepts every bit pattern. The fixed-vector
+                    // decoder supplies exactly the sum of their wire widths.
+                    quote! {
+                        #[inline]
+                        fn __deserialize_vec<__D: #spacetimedb_lib::de::Deserializer<'de>>(__de: __D) -> Result<::std::vec::Vec<Self>, __D::Error> {
+                            if #check {
+                                __de.deserialize_fixed_vec(|__bytes: [u8; #width]| {
+                                    let mut __src = __bytes.as_slice();
+                                    Self { #(#names: #spacetimedb_lib::bsatn::from_reader(&mut __src).expect("complete scalar span"),)* }
+                                })
+                            } else {
+                                __de.deserialize_vec()
+                            }
                         }
                     }
                 });
-            }
+                quote! {
+                    #bulk
+                    #[inline]
+                    fn deserialize_from_bsatn<__R: #spacetimedb_lib::buffer::BufReader<'de>>(
+                        mut __de: #spacetimedb_lib::bsatn::Deserializer<'_, __R>
+                    ) -> Result<Self, #spacetimedb_lib::bsatn::DecodeError> {
+                        #read
+                    }
+                }
+            };
 
             let n_fields = fields.len();
 
@@ -428,6 +585,7 @@ pub(crate) fn derive_deserialize(ty: &SatsType<'_>) -> TokenStream {
                             #n_fields
                         }
 
+                        #[inline]
                         fn visit_seq_product<A: #spacetimedb_lib::de::SeqProductAccess<'de>>(self, mut tup: A) -> Result<Self::Output, A::Error> {
                             Ok(#name {
                                 #(#field_names:
@@ -526,6 +684,14 @@ pub(crate) fn derive_deserialize(ty: &SatsType<'_>) -> TokenStream {
             let variant_names = variants.iter().map(|var| &*var.name).collect::<Vec<_>>();
             let variant_idents = variants.iter().map(|var| var.ident).collect::<Vec<_>>();
             let tags = 0u8..;
+            let binary_arms = variants.iter().zip(0u8..).map(|(var, tag)| {
+                let ident = var.ident;
+                if let Some(member) = &var.member {
+                    quote!(#tag => Ok(Self::#ident { #member: __de.field()? }))
+                } else {
+                    quote!(#tag => Ok(Self::#ident))
+                }
+            });
             let arms = variants.iter().map(|var| {
                 let ident = var.ident;
                 if let (Some(member), Some(ty)) = (&var.member, var.ty) {
@@ -557,6 +723,17 @@ pub(crate) fn derive_deserialize(ty: &SatsType<'_>) -> TokenStream {
                 #[allow(clippy::all)]
                 const _: () = {
                     impl #de_impl_generics #spacetimedb_lib::de::Deserialize<'de> for #name #ty_generics #de_where_clause {
+                        #[inline]
+                        fn deserialize_from_bsatn<__R: #spacetimedb_lib::buffer::BufReader<'de>>(
+                            mut __de: #spacetimedb_lib::bsatn::Deserializer<'_, __R>
+                        ) -> Result<Self, #spacetimedb_lib::bsatn::DecodeError> {
+                            match __de.field::<::core::primitive::u8>()? {
+                                #(#binary_arms,)*
+                                __tag => Err(#spacetimedb_lib::bsatn::DecodeError::InvalidTag {
+                                    tag: __tag, sum_name: Some(#tuple_name.to_owned()),
+                                }),
+                            }
+                        }
                         fn deserialize<D: #spacetimedb_lib::de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
                             deserializer.deserialize_sum(__SumVisitor {
                                 _marker: std::marker::PhantomData::<fn() -> #name #ty_generics>,
@@ -648,36 +825,92 @@ pub(crate) fn derive_serialize(ty: &SatsType) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     let mut fast_body = None;
+    let size_hint;
     let body = match &ty.data {
         SatsTypeData::Product(fields) => {
-            if let Some(fields) = extract_repr_c_primitive(ty) {
+            let names = fields.iter().map(|field| field.ident.unwrap());
+            let types = fields.iter().map(|field| field.ty);
+            size_hint = Some(quote! {
+                const BSATN_FIXED_SIZE: ::core::option::Option<usize> =
+                    #spacetimedb_lib::bsatn::product_width(&[#(<#types as #serialize_t>::BSATN_FIXED_SIZE),*]);
+
+                fn bsatn_size_hint(&self) -> ::core::option::Option<usize> {
+                    let __size = 0usize;
+                    #(let __size = __size.checked_add(#spacetimedb_lib::ser::Serialize::bsatn_size_hint(&self.#names)?)?;)*
+                    Some(__size)
+                }
+            });
+            if let Some((width, can_copy)) = packed_bsatn_layout(ty) {
+                let names = fields.iter().map(|f| f.ident.unwrap());
+                let as_bytes = if ty.bsatn_pod {
+                    quote! { #spacetimedb_lib::bsatn::pod_bytes(__items) }
+                } else {
+                    // SAFETY: `__items` is a valid slice; `can_copy` proves that its
+                    // entire footprint is initialized and is precisely its BSATN payload.
+                    quote! { unsafe {
+                        core::slice::from_raw_parts(__items.as_ptr().cast::<u8>(), core::mem::size_of_val(__items))
+                    } }
+                };
                 fast_body = Some(quote! {
                     #[inline(always)]
                     fn serialize_into_bsatn<W: #spacetimedb_lib::buffer::BufWriter>(
                             &self,
                             serializer: #spacetimedb_lib::bsatn::Serializer<'_, W>
                     ) -> Result<(), #spacetimedb_lib::bsatn::EncodeError> {
-                        const _: () = {
-                            #(#spacetimedb_lib::bsatn::assert_is_primitive_type::<#fields>();)*
-                        };
-                        // This guarantees that `Self` has no padding.
-                        if const { core::mem::size_of::<Self>() == #(core::mem::size_of::<#fields>())+* } {
-                            // SAFETY:
-                            // - We know `self` is non-null as it's a shared reference
-                            //   and we know it's valid for reads for `core::mem::size_of::<Self>()` bytes.
-                            //   Alignment of `u8` is 1, so it's trivially satisfied.
-                            //   - The slice is all within `self`, so in the same allocated object.
-                            // - `self` does point to `core::mem::size_of::<Self>()` consecutive `u8`s,
-                            //    as per `assert_is_primitive_type` above,
-                            //    we know none of the fields of `Self` have any padding.
-                            // - We're not going to mutate the memory within `bytes`.
-                            // - We know `core::mem::size_of::<Self>() < isize::MAX`.
-                            let bytes = unsafe { core::slice::from_raw_parts(self as *const _ as *const u8, core::mem::size_of::<Self>()) };
-                            serializer.raw_write_bytes(bytes);
-                            Ok(())
+                        let mut __bytes = [0u8; #width];
+                        let mut __end = 0;
+                        #({
+                            let __field = self.#names.to_le_bytes();
+                            let __start = __end;
+                            __end += __field.len();
+                            __bytes[__start..__end].copy_from_slice(&__field);
+                        })*
+                        serializer.raw_write_bytes(&__bytes);
+                        Ok(())
+                    }
+
+                    fn __serialize_array<S: #spacetimedb_lib::ser::Serializer>(__items: &[Self], ser: S) -> Result<S::Ok, S::Error> {
+                        if #can_copy {
+                            ser.serialize_packed_array(__items, #as_bytes)
                         } else {
-                            self.serialize(serializer)
+                            ser.serialize_slice(__items)
                         }
+                    }
+                });
+            } else {
+                let write = bsatn_product_fields(ty, fields, false);
+                let fresh = scalar_row(ty, fields).map(|(width, check)| {
+                    let names = fields.iter().map(|f| f.ident.unwrap());
+                    let pack = quote! {
+                        let mut __bytes = [0u8; #width];
+                        let mut __dst = __bytes.as_mut_slice();
+                        #(#spacetimedb_lib::bsatn::to_writer(&mut __dst, &__row.#names).expect("scalar write");)*
+                        __bytes
+                    };
+                    quote! {
+                        #[inline]
+                        fn __bsatn_vec(&self) -> ::core::option::Option<::std::vec::Vec<::core::primitive::u8>> {
+                            if !(#check) { return None; }
+                            let __row = self;
+                            Some({ #pack }.to_vec())
+                        }
+
+                        fn __serialize_array<__S: #spacetimedb_lib::ser::Serializer>(__rows: &[Self], __ser: __S) -> Result<__S::Ok, __S::Error> {
+                            if #check && __rows.len() >= 8 {
+                                __ser.serialize_fixed_array(__rows, |__row| { #pack })
+                            } else {
+                                __ser.serialize_slice(__rows)
+                            }
+                        }
+                    }
+                });
+                fast_body = Some(quote! {
+                    #fresh
+                    #[inline]
+                    fn serialize_into_bsatn<__W: #spacetimedb_lib::buffer::BufWriter>(
+                        &self, mut __ser: #spacetimedb_lib::bsatn::Serializer<'_, __W>
+                    ) -> Result<(), #spacetimedb_lib::bsatn::EncodeError> {
+                        #write
                     }
                 });
             }
@@ -708,6 +941,25 @@ pub(crate) fn derive_serialize(ty: &SatsType) -> TokenStream {
                     }
                 }
             });
+            let hints = variants.iter().map(|var| {
+                let name = var.ident;
+                if let Some(member) = &var.member {
+                    quote!(Self::#name { #member: __v } => #spacetimedb_lib::ser::Serialize::bsatn_size_hint(__v)?.checked_add(1))
+                } else {
+                    quote!(Self::#name => Some(1))
+                }
+            });
+            let width = variants.iter().all(|v| v.member.is_none()).then(|| {
+                quote! {
+                    const BSATN_FIXED_SIZE: ::core::option::Option<usize> = Some(1);
+                }
+            });
+            size_hint = Some(quote! {
+                #width
+                fn bsatn_size_hint(&self) -> ::core::option::Option<usize> {
+                    match self { #(#hints,)* _ => None }
+                }
+            });
             quote!(match self {
                 #(#arms)*
                 _ => unreachable!(),
@@ -717,6 +969,7 @@ pub(crate) fn derive_serialize(ty: &SatsType) -> TokenStream {
     quote! {
         impl #impl_generics #spacetimedb_lib::ser::Serialize for #name #ty_generics #where_clause {
             #fast_body
+            #size_hint
             // __ reserved name for binding to prevent name conflicts. See module-level doc comment.
             fn serialize<S: #spacetimedb_lib::ser::Serializer>(&self, __serializer: S) -> Result<S::Ok, S::Error> {
                 #body

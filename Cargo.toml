@@ -202,6 +202,7 @@ blake3 = "1.5.1"
 brotli = "9.0.0"
 lz4_flex = { version = "0.12" }
 bytemuck = { version = "1.16.2", features = ["must_cast"] }
+simdutf8 = "0.1.5"
 bytes = "1.10.1"
 bytestring = { version = "1.2.0", features = ["serde"] }
 cargo_metadata = "0.17.0"

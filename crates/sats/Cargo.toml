@@ -40,7 +40,7 @@ spacetimedb-metrics = { workspace = true, optional = true }
 anyhow.workspace = true
 arrayvec.workspace = true
 bytes.workspace = true
-bytemuck.workspace = true
+bytemuck = { workspace = true, features = ["extern_crate_alloc"] }
 bytestring = { workspace = true, optional = true }
 chrono = { workspace = true, features = ["alloc"] }
 decorum.workspace = true
@@ -57,6 +57,7 @@ sha3.workspace = true
 second-stack.workspace = true
 serde = { workspace = true, optional = true }
 smallvec.workspace = true
+simdutf8.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 
@@ -68,14 +69,20 @@ rand = { workspace = true, features = ["std"] }
 blake3 = { workspace = true, optional = true }
 
 [dev-dependencies]
+bytemuck = { workspace = true, features = ["derive"] }
 ahash.workspace = true
 bytes.workspace = true
+criterion.workspace = true
 rand.workspace = true
 # Also as dev-dependencies for use in _this_ crate's tests.
 proptest.workspace = true
 proptest-derive.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+
+[[bench]]
+name = "bsatn"
+harness = false
 
 [lints]
 workspace = true

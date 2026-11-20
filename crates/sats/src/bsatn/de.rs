@@ -32,10 +32,39 @@ impl<'a, 'de, R: BufReader<'de>> Deserializer<'a, R> {
         self.reader.get_slice(len)
     }
 
+    /// Read an exactly sized block for a derived fixed-width product.
+    #[inline]
+    #[doc(hidden)]
+    pub fn get_array<const N: usize>(&mut self) -> Result<&'de [u8; N], DecodeError> {
+        self.reader.get_array()
+    }
+
+    /// Probe a whole scalar run. On short input, leave the individual field
+    /// readers to advance the cursor and report the usual field-specific error.
+    #[inline]
+    #[doc(hidden)]
+    pub fn try_get_array<const N: usize>(&mut self) -> Option<&'de [u8; N]> {
+        self.reader.get_array_chunk()
+    }
+
+    /// Decode the next field of a derived BSATN product.
+    #[inline]
+    #[doc(hidden)]
+    pub fn field<T: de::Deserialize<'de>>(&mut self) -> Result<T, DecodeError> {
+        T::deserialize_from_bsatn(self.reborrow())
+    }
+
     /// Reads a byte slice from the `reader`.
     fn deserialize_bytes_inner(mut self) -> Result<&'de [u8], DecodeError> {
         let len = self.reborrow().deserialize_len()?;
         self.get_slice(len)
+    }
+
+    /// Check the complete span before using an untrusted element count for allocation.
+    fn fixed_payload(mut self, width: usize) -> Result<(usize, &'de [u8]), DecodeError> {
+        let len = self.reborrow().deserialize_len()?;
+        let size = len.checked_mul(width).ok_or(DecodeError::AllocationFailed(len))?;
+        Ok((len, self.get_slice(size)?))
     }
 }
 
@@ -56,6 +85,10 @@ impl de::Error for DecodeError {
 
 impl<'de, R: BufReader<'de>> de::Deserializer<'de> for Deserializer<'_, R> {
     type Error = DecodeError;
+
+    fn deserialize_value<T: de::Deserialize<'de>>(self) -> Result<T, DecodeError> {
+        T::deserialize_from_bsatn(self)
+    }
 
     fn deserialize_product<V: de::ProductVisitor<'de>>(self, visitor: V) -> Result<V::Output, DecodeError> {
         visitor.visit_seq_product(self)
@@ -93,6 +126,46 @@ impl<'de, R: BufReader<'de>> de::Deserializer<'de> for Deserializer<'_, R> {
     fn deserialize_u64(self) -> Result<u64, DecodeError> {
         self.reader.get_u64()
     }
+    fn deserialize_vec<T: de::Deserialize<'de>>(mut self) -> Result<Vec<T>, DecodeError> {
+        let len = self.reborrow().deserialize_len()?;
+        let cap = len.min(de::RESERVE_ARRAY_ELEMENTS);
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(cap)
+            .map_err(|_| DecodeError::AllocationFailed(cap))?;
+        for _ in 0..len {
+            values.push(self.field()?);
+        }
+        Ok(values)
+    }
+    #[inline(always)]
+    fn deserialize_fixed_vec<T: de::Deserialize<'de>, const N: usize>(
+        self,
+        decode: impl Fn([u8; N]) -> T,
+    ) -> Result<Vec<T>, DecodeError> {
+        if N == 0 {
+            return self.deserialize_array(de::BasicVecVisitor);
+        }
+        let (len, bytes) = self.fixed_payload(N)?;
+        let chunks = bytes.as_chunks::<N>().0;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(len)
+            .map_err(|_| DecodeError::AllocationFailed(len))?;
+        values.extend(chunks.iter().copied().map(decode));
+        Ok(values)
+    }
+
+    #[inline(always)]
+    fn deserialize_pod_vec<T: de::Deserialize<'de> + bytemuck::Pod>(self) -> Result<Vec<T>, DecodeError> {
+        if size_of::<T>() == 0 {
+            return self.deserialize_array(de::BasicVecVisitor);
+        }
+        let (len, bytes) = self.fixed_payload(size_of::<T>())?;
+        let mut values = bytemuck::allocation::try_zeroed_vec(len).map_err(|_| DecodeError::AllocationFailed(len))?;
+        bytemuck::cast_slice_mut(&mut values).copy_from_slice(bytes);
+        Ok(values)
+    }
     fn deserialize_u128(self) -> Result<u128, DecodeError> {
         self.reader.get_u128()
     }
@@ -126,7 +199,12 @@ impl<'de, R: BufReader<'de>> de::Deserializer<'de> for Deserializer<'_, R> {
 
     fn deserialize_str<V: de::SliceVisitor<'de, str>>(self, visitor: V) -> Result<V::Output, Self::Error> {
         let slice = self.deserialize_bytes_inner()?;
-        let slice = core::str::from_utf8(slice)?;
+        // Keep short strings on the std fast path. Long strings only need a pass/fail check.
+        let slice = if slice.len() < 64 {
+            core::str::from_utf8(slice)?
+        } else {
+            simdutf8::basic::from_utf8(slice).map_err(|_| DecodeError::InvalidUtf8)?
+        };
         visitor.visit_borrowed(slice)
     }
 

@@ -6,6 +6,10 @@ edition = "2021"
 publish = false
 default-run = "streaming-decompression-bench"
 
+[features]
+default = ["client-cache"]
+client-cache = ["spacetimedb-sdk/client-cache"]
+
 [[bin]]
 name = "streaming-decompression-bench"
 path = "../streaming_decompression.rs"
@@ -17,6 +21,14 @@ path = "compression_tradeoff.rs"
 [[bin]]
 name = "compression-pipeline-bench"
 path = "compression_pipeline.rs"
+
+[[bin]]
+name = "row-offsets-bench"
+path = "row_offsets.rs"
+
+[[bin]]
+name = "row-decode-bench"
+path = "row_decode.rs"
 
 [[test]]
 name = "streaming_decompression"
@@ -31,13 +43,15 @@ name = "experimental_lz4"
 path = "lz4_tests.rs"
 
 [dependencies]
-spacetimedb-sdk = { path = "../..", features = ["streaming-decompression"] }
+spacetimedb-sdk = { path = "../..", default-features = false, features = ["streaming-decompression"] }
 spacetimedb-client-api-messages.workspace = true
 spacetimedb-sats.workspace = true
 brotli.workspace = true
 flate2.workspace = true
 zstd = { version = "0.13.3", features = ["zstdmt"] }
 lz4_flex.workspace = true
+# Use the workspace's vendored TLS library rather than the host OpenSSL version.
+openssl.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

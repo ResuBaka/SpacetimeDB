@@ -225,10 +225,41 @@ impl<'r, Row> TableAppliedDiff<'r, Row> {
     /// Given this applied diff and a function `derive_pk` to extract the primary key,
     /// this restructures the diff such that row updates are found.
     fn derive_updates<Pk: Eq + Hash>(&mut self, derive_pk: impl Fn(&Row) -> &Pk) {
-        if self.deletes.is_empty() {
+        if self.deletes.is_empty() || self.inserts.is_empty() {
             return;
         }
 
+        if let ([(_, old)], [(_, new)]) = (&self.deletes[..], &self.inserts[..]) {
+            if derive_pk(old) == derive_pk(new) {
+                self.update_deletes.push(old);
+                self.update_inserts.push(new);
+                self.deletes.clear();
+                self.inserts.clear();
+            }
+            return;
+        }
+
+        // Scan the existing contiguous delete list for small diffs. Removing
+        // the first match keeps duplicate keys FIFO and unmatched deletes in
+        // wire order. Bound both lengths to cap comparisons and shifts.
+        const SMALL_BATCH: usize = 8;
+        if self.deletes.len() <= SMALL_BATCH && self.inserts.len() <= SMALL_BATCH {
+            self.inserts.retain(|(_, new)| {
+                let key = derive_pk(new);
+                let Some(i) = self.deletes.iter().position(|(_, old)| derive_pk(old) == key) else {
+                    return true;
+                };
+                self.update_deletes.push(self.deletes.remove(i).1);
+                self.update_inserts.push(new);
+                false
+            });
+            return;
+        }
+
+        self.derive_updates_hashed(derive_pk);
+    }
+
+    fn derive_updates_hashed<Pk: Eq + Hash>(&mut self, derive_pk: impl Fn(&Row) -> &Pk) {
         let mut deletes_by_pk: HashMap<&Pk, usize> = HashMap::default();
         deletes_by_pk.reserve(self.deletes.len());
         let mut next_delete_by_pk = vec![None; self.deletes.len()];
@@ -316,6 +347,46 @@ mod applied_diff_tests {
         }
     }
 
+    // Run explicitly with --ignored --nocapture. Measures diff construction,
+    // primary-key matching and destruction, excluding BSATN and user callbacks.
+    #[test]
+    #[ignore = "primary-key matching microbenchmark"]
+    fn bench_pk_matching() {
+        use std::{hint::black_box, time::Instant};
+        for (deletes, inserts) in [
+            (4, 0),
+            (0, 4),
+            (1, 1),
+            (2, 2),
+            (4, 4),
+            (8, 8),
+            (9, 9),
+            (16, 16),
+            (256, 256),
+        ] {
+            for shape in ["reversed", "miss", "duplicates"] {
+                let mut update = TableUpdate::default();
+                let key = |n| if shape == "duplicates" { n % 2 } else { n };
+                update.deletes = (0..deletes).map(|i| row(key(i), i)).collect();
+                update.inserts = (0..inserts)
+                    .rev()
+                    .map(|i| row(if shape == "miss" { deletes + i } else { key(i) }, i))
+                    .collect();
+                let iters = 400_000 / inserts.max(deletes).max(1);
+                let start = Instant::now();
+                for _ in 0..iters {
+                    drop(black_box(
+                        TableAppliedDiff::from_raw(black_box(&update)).with_updates_by_pk(|r| &r.id),
+                    ));
+                }
+                println!(
+                    "pk {deletes} {inserts} {shape} {:.2}",
+                    start.elapsed().as_nanos() as f64 / iters as f64
+                );
+            }
+        }
+    }
+
     #[test]
     fn dispatch_guards_preserve_empty_initial_snapshots_and_all_row_events() {
         let mut update = TableUpdate::<PkRow>::default();
@@ -365,6 +436,69 @@ mod applied_diff_tests {
             vec![&update.deletes[1].row, &update.deletes[2].row]
         );
         assert_eq!(applied.inserts().collect::<Vec<_>>(), vec![&update.inserts[1].row]);
+    }
+
+    #[test]
+    fn one_sided_batches_do_not_project_keys() {
+        for delete_only in [false, true] {
+            let mut update = TableUpdate::default();
+            let rows = if delete_only {
+                &mut update.deletes
+            } else {
+                &mut update.inserts
+            };
+            rows.extend([row(2, 10), row(1, 11)]);
+            let applied = TableAppliedDiff::from_raw(&update).with_updates_by_pk::<u32>(|_| panic!("unneeded lookup"));
+            assert_eq!(applied.updates().count(), 0);
+            assert_eq!(
+                applied
+                    .deletes()
+                    .chain(applied.inserts())
+                    .map(|r| r.value)
+                    .collect::<Vec<_>>(),
+                [10, 11]
+            );
+            assert_eq!(applied.inserts().count(), if delete_only { 0 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn duplicate_pairing_and_event_order_agree_across_batch_sizes() {
+        // Extra rows have disjoint keys, so they change the matcher used
+        // without affecting which of the first few rows should pair.
+        for extra_deletes in [0, 4, 5] {
+            for extra_inserts in [0, 4, 5] {
+                let mut update = TableUpdate::default();
+                update.deletes = vec![row(1, 10), row(7, 70), row(2, 20), row(1, 11)];
+                update.inserts = vec![row(2, 21), row(1, 12), row(1, 13), row(1, 14)];
+                update.deletes.extend((0..extra_deletes).map(|i| row(100 + i, 100 + i)));
+                update.inserts.extend((0..extra_inserts).map(|i| row(200 + i, 200 + i)));
+                let diff = TableAppliedDiff::from_raw(&update).with_updates_by_pk(|r| &r.id);
+                assert!(diff
+                    .updates()
+                    .map(|(o, n)| (o.value, n.value))
+                    .eq([(20, 21), (10, 12), (11, 13)]));
+                assert!(diff
+                    .deletes()
+                    .map(|r| r.value)
+                    .eq([70].into_iter().chain(100..100 + extra_deletes)));
+                assert!(diff
+                    .inserts()
+                    .map(|r| r.value)
+                    .eq([14].into_iter().chain(200..200 + extra_inserts)));
+            }
+        }
+    }
+
+    #[test]
+    fn single_pair_with_different_keys_remains_separate() {
+        let mut update = TableUpdate::default();
+        update.deletes.push(row(1, 10));
+        update.inserts.push(row(2, 20));
+        let diff = TableAppliedDiff::from_raw(&update).with_updates_by_pk(|r| &r.id);
+        assert_eq!(diff.updates().count(), 0);
+        assert!(diff.deletes().eq([&update.deletes[0].row]));
+        assert!(diff.inserts().eq([&update.inserts[0].row]));
     }
 
     #[test]

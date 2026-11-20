@@ -44,19 +44,27 @@ macro_rules! impl_deserialize {
     };
 }
 
-/// Implements [`Deserialize`] for a primitive type.
-///
-/// The `$method` is a parameterless method on `deserializer` to call.
-macro_rules! impl_prim {
-    ($(($prim:ty, $method:ident))*) => {
-        $(impl_deserialize!([] $prim, de => de.$method());)*
-    };
+impl_deserialize!([] bool, de => de.deserialize_bool());
+
+macro_rules! impl_number {
+    ($(($prim:ty, $method:ident))*) => {$(
+        impl<'de> Deserialize<'de> for $prim {
+            fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+                de.$method()
+            }
+
+            #[inline(always)]
+            fn __deserialize_vec<D: Deserializer<'de>>(de: D) -> Result<Vec<Self>, D::Error> {
+                de.deserialize_fixed_vec(Self::from_le_bytes)
+            }
+        }
+    )*};
 }
 
-impl_prim! {
-    (bool, deserialize_bool)
-    /*(u8, deserialize_u8)*/ (u16, deserialize_u16) (u32, deserialize_u32) (u64, deserialize_u64) (u128, deserialize_u128) (u256, deserialize_u256)
-    (i8, deserialize_i8)     (i16, deserialize_i16) (i32, deserialize_i32) (i64, deserialize_i64) (i128, deserialize_i128) (i256, deserialize_i256)
+impl_number! {
+    (u16, deserialize_u16) (u32, deserialize_u32) (u128, deserialize_u128)
+    (u256, deserialize_u256) (i256, deserialize_i256)
+    (i8, deserialize_i8) (i16, deserialize_i16) (i32, deserialize_i32) (i64, deserialize_i64) (i128, deserialize_i128)
     (f32, deserialize_f32) (f64, deserialize_f64)
 }
 
@@ -103,6 +111,7 @@ macro_rules! impl_deserialize_tuple {
             type Output = ($($ty_name,)*);
             fn product_name(&self) -> Option<&str> { None }
             fn product_len(&self) -> usize { crate::count!($($ty_name)*) }
+            #[inline]
             fn visit_seq_product<A: SeqProductAccess<'de>>(self, mut _prod: A) -> Result<Self::Output, A::Error> {
                 $(
                     #[allow(non_snake_case)]
@@ -211,6 +220,17 @@ impl<'de> Deserialize<'de> for u8 {
     }
 }
 
+impl<'de> Deserialize<'de> for u64 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_u64()
+    }
+
+    #[inline(always)]
+    fn __deserialize_vec<D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Self>, D::Error> {
+        deserializer.deserialize_u64_vec()
+    }
+}
+
 impl_deserialize!([] F32, de => f32::deserialize(de).map(Into::into));
 impl_deserialize!([] F64, de => f64::deserialize(de).map(Into::into));
 impl_deserialize!(
@@ -223,11 +243,18 @@ impl_deserialize!(
     de => <Cow<'_, str>>::deserialize(de).map(|s| (&*s).into()),
     de => <&str>::validate(de)
 );
-impl_deserialize!(
-    [T: Deserialize<'de>] Vec<T>,
-    de => T::__deserialize_vec(de),
-    de => de.validate_array_seed(BasicVecVisitor, PhantomData::<T>)
-);
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Vec<T> {
+    // Keep the forwarding layer transparent: materializing Result<Vec<T>, _>
+    // at each boundary is particularly expensive for singleton numeric arrays.
+    #[inline(always)]
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        T::__deserialize_vec(de)
+    }
+
+    fn validate<D: Deserializer<'de>>(de: D) -> Result<(), D::Error> {
+        de.validate_array_seed(BasicVecVisitor, PhantomData::<T>)
+    }
+}
 impl_deserialize!(
     [T: Deserialize<'de>, const N: usize] SmallVec<[T; N]>,
     de => de.deserialize_array(BasicSmallVecVisitor),
@@ -764,7 +791,7 @@ impl<'de> DeserializeSeed<'de> for WithTypespace<'_, ArrayType> {
             de: D,
             map: impl FnOnce(Box<[T]>) -> ArrayValue,
         ) -> Result<ArrayValue, D::Error> {
-            de.deserialize_array(BasicVecVisitor).map(<Box<[_]>>::from).map(map)
+            Box::<[T]>::deserialize(de).map(map)
         }
 
         let mut ty = &*self.ty().elem_ty;

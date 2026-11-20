@@ -30,18 +30,24 @@ use std::sync::Arc;
 /// ```
 #[macro_export]
 macro_rules! impl_serialize {
-    ([$($generics:tt)*] $(where [$($wc:tt)*])? $typ:ty, ($self:ident, $ser:ident) => $body:expr) => {
+    ([$($generics:tt)*] $(where [$($wc:tt)*])? $typ:ty, ($self:ident, $ser:ident) => $body:expr $(, $this:ident => $hint:expr)?) => {
         impl<$($generics)*> $crate::ser::Serialize for $typ $(where $($wc)*)? {
             fn serialize<S: $crate::ser::Serializer>($self: &Self, $ser: S) -> Result<S::Ok, S::Error> {
                 $body
             }
+            $(fn bsatn_size_hint($this: &Self) -> Option<usize> { $hint })?
         }
     };
 }
 
 macro_rules! impl_prim {
     ($(($prim:ty, $method:ident))*) => {
-        $(impl_serialize!([] $prim, (self, ser) => ser.$method((*self).into()));)*
+        $(impl Serialize for $prim {
+            const BSATN_FIXED_SIZE: Option<usize> = Some(size_of::<Self>());
+            fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+                ser.$method(*self)
+            }
+        })*
     };
 }
 
@@ -59,6 +65,12 @@ macro_rules! impl_serialize_tuple {
             let ($($ty_name,)*) = self;
             $(_tup.serialize_element($ty_name)?;)*
             _tup.end()
+        }, self => {
+            #[allow(non_snake_case)]
+            let ($($ty_name,)*) = self;
+            let size = 0usize;
+            $(let size = size.checked_add($ty_name.bsatn_size_hint()?)?;)*
+            Some(size)
         });
     };
 }
@@ -76,19 +88,43 @@ impl_serialize_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9);
 impl_serialize_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10);
 impl_serialize_tuple!(T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10, T11);
 
-// `u8` is implemented below as we wish to provide different `__serialize_array` impl (see below).
 impl_prim! {
     (bool, serialize_bool)
-                       (u16, serialize_u16) (u32, serialize_u32) (u64, serialize_u64) (u128, serialize_u128) (u256, serialize_u256)
-    (i8, serialize_i8) (i16, serialize_i16) (i32, serialize_i32) (i64, serialize_i64) (i128, serialize_i128) (i256, serialize_i256)
-    (f32, serialize_f32) (f64, serialize_f64) (str, serialize_str)
+    (i256, serialize_i256) (u256, serialize_u256)
 }
 
-// TODO(Centril): this special case doesn't seem well motivated.
-// Consider generalizing this to apply to all primitive types
-// so that we can move this into `impl_prim!`.
-// This will make BSATN-serializing `[u32]` faster for example.
+fn string_size(s: &str) -> Option<usize> {
+    u32::try_from(s.len()).ok()?;
+    s.len().checked_add(size_of::<u32>())
+}
+
+impl_serialize!([] str, (self, ser) => ser.serialize_str(self), self => string_size(self));
+
+macro_rules! impl_number {
+    ($(($prim:ty, $method:ident))*) => {$(
+        impl Serialize for $prim {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.$method(*self)
+            }
+            const BSATN_FIXED_SIZE: Option<usize> = Some(size_of::<Self>());
+
+            #[cfg(target_endian = "little")]
+            fn __serialize_array<S: Serializer>(this: &[Self], serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_packed_array(this, bytemuck::cast_slice(this))
+            }
+        }
+    )*};
+}
+
+impl_number! {
+    (u16, serialize_u16) (u32, serialize_u32) (u64, serialize_u64) (u128, serialize_u128)
+    (i8, serialize_i8) (i16, serialize_i16) (i32, serialize_i32) (i64, serialize_i64) (i128, serialize_i128)
+    (f32, serialize_f32) (f64, serialize_f64)
+}
+
+// Other formats may distinguish bytes from an array of numbers.
 impl Serialize for u8 {
+    const BSATN_FIXED_SIZE: Option<usize> = Some(1);
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_u8(*self)
     }
@@ -103,19 +139,35 @@ impl Serialize for u8 {
 
 impl_serialize!([] F32, (self, ser) => f32::from(*self).serialize(ser));
 impl_serialize!([] F64, (self, ser) => f64::from(*self).serialize(ser));
-impl_serialize!([T: Serialize] Vec<T>, (self, ser)  => (**self).serialize(ser));
-impl_serialize!([T: Serialize, const N: usize] SmallVec<[T; N]>, (self, ser)  => (**self).serialize(ser));
-impl_serialize!([T: Serialize] [T], (self, ser) => T::__serialize_array(self, ser));
-impl_serialize!([T: Serialize, const N: usize] [T; N], (self, ser) => T::__serialize_array(self, ser));
-impl_serialize!([T: Serialize + ?Sized] Box<T>, (self, ser) => (**self).serialize(ser));
-impl_serialize!([T: Serialize + ?Sized] Rc<T>, (self, ser) => (**self).serialize(ser));
-impl_serialize!([T: Serialize + ?Sized] Arc<T>, (self, ser) => (**self).serialize(ser));
-impl_serialize!([T: Serialize + ?Sized] &T, (self, ser) => (**self).serialize(ser));
-impl_serialize!([] String, (self, ser) => ser.serialize_str(self));
-impl_serialize!([] LeanString, (self, ser) => ser.serialize_str(self));
+fn slice_size<T: Serialize>(items: &[T]) -> Option<usize> {
+    u32::try_from(items.len()).ok()?;
+    if let Some(width) = T::BSATN_FIXED_SIZE {
+        items.len().checked_mul(width)?.checked_add(4)
+    } else if items.len() <= 4 {
+        // Small nested protocol lists can be sized more cheaply than growing the packet.
+        items
+            .iter()
+            .try_fold(4usize, |n, x| n.checked_add(x.bsatn_size_hint()?))
+    } else {
+        None
+    }
+}
+impl_serialize!([T: Serialize] Vec<T>, (self, ser)  => (**self).serialize(ser), self => slice_size(self));
+impl_serialize!([T: Serialize, const N: usize] SmallVec<[T; N]>, (self, ser)  => (**self).serialize(ser), self => slice_size(self));
+impl_serialize!([T: Serialize] [T], (self, ser) => T::__serialize_array(self, ser), self => slice_size(self));
+impl_serialize!([T: Serialize, const N: usize] [T; N], (self, ser) => T::__serialize_array(self, ser), self => slice_size(self));
+impl_serialize!([T: Serialize + ?Sized] Box<T>, (self, ser) => (**self).serialize(ser), self => (**self).bsatn_size_hint());
+impl_serialize!([T: Serialize + ?Sized] Rc<T>, (self, ser) => (**self).serialize(ser), self => (**self).bsatn_size_hint());
+impl_serialize!([T: Serialize + ?Sized] Arc<T>, (self, ser) => (**self).serialize(ser), self => (**self).bsatn_size_hint());
+impl_serialize!([T: Serialize + ?Sized] &T, (self, ser) => (**self).serialize(ser), self => (**self).bsatn_size_hint());
+impl_serialize!([] String, (self, ser) => ser.serialize_str(self), self => string_size(self));
+impl_serialize!([] LeanString, (self, ser) => ser.serialize_str(self), self => string_size(self));
 impl_serialize!([T: Serialize] Option<T>, (self, ser) => match self {
     Some(v) => ser.serialize_variant(0, Some("some"), v),
     None => ser.serialize_variant(1, Some("none"), &()),
+}, self => match self {
+    Some(v) => v.bsatn_size_hint()?.checked_add(1),
+    None => Some(1),
 });
 impl_serialize!([T: Serialize, E: Serialize] Result<T, E>, (self, ser) => match self {
     Ok(v) => ser.serialize_variant(0, Some("ok"), v),
@@ -283,7 +335,7 @@ impl_serialize!([] ColSet, (self, ser) => {
 #[cfg(feature = "blake3")]
 impl_serialize!([] blake3::Hash, (self, ser) => self.as_bytes().serialize(ser));
 
-impl_serialize!([] bytes::Bytes, (self, ser) => ser.serialize_bytes(self));
+impl_serialize!([] bytes::Bytes, (self, ser) => ser.serialize_bytes(self), self => slice_size::<u8>(self));
 
 #[cfg(feature = "bytestring")]
-impl_serialize!([] bytestring::ByteString, (self, ser) => ser.serialize_str(self));
+impl_serialize!([] bytestring::ByteString, (self, ser) => ser.serialize_str(self), self => string_size(self));

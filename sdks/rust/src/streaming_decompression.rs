@@ -8,7 +8,7 @@ use spacetimedb_sats::{
     de::{self, Deserialize, Deserializer as _},
     i256, u256,
 };
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::sync::Arc;
 
 pub(crate) fn decode(raw: &[u8]) -> Result<ServerMessage, WsError> {
@@ -47,7 +47,7 @@ pub(crate) fn decode_reader(reader: impl Read, scheme: &'static str) -> Result<S
 }
 
 struct Decoder<'a, R> {
-    reader: &'a mut R,
+    reader: &'a mut BufReader<R>,
     io_error: Option<io::Error>,
 }
 
@@ -85,6 +85,16 @@ impl<R: Read> Decoder<'_, R> {
     fn bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
         let len = u32::from_le_bytes(self.array()?) as usize;
         let mut bytes = Vec::new();
+        // A complete field already in the decompressed buffer needs one copy,
+        // not a zero-fill followed by a read into the same memory.
+        if let Some(field) = self.reader.buffer().get(..len) {
+            bytes
+                .try_reserve_exact(len)
+                .map_err(|_| DecodeError::AllocationFailed(len))?;
+            bytes.extend_from_slice(field);
+            self.reader.consume(len);
+            return Ok(bytes);
+        }
         // Do not trust a length prefix enough to reserve gigabytes before seeing
         // data. Grow the final owned field incrementally, with fallible reserves.
         // This is not a new message-size limit.
@@ -130,6 +140,27 @@ impl<'de, R: Read> de::Deserializer<'de> for &mut Decoder<'_, R> {
         deserialize_u64 => u64, deserialize_u128 => u128, deserialize_u256 => u256,
         deserialize_i8 => i8, deserialize_i16 => i16, deserialize_i32 => i32,
         deserialize_i64 => i64, deserialize_i128 => i128, deserialize_i256 => i256,
+    }
+    fn deserialize_u64_vec(self) -> Result<Vec<u64>, DecodeError> {
+        let len = self.deserialize_u32()? as usize;
+        let mut values = Vec::new();
+        while values.len() < len {
+            let words = self.reader.buffer().as_chunks::<8>().0;
+            let n = (len - values.len()).min(words.len());
+            if n == 0 {
+                // Refill or finish a word straddling buffers, using the same
+                // short-read, Interrupted and codec error handling as a scalar.
+                let value = self.deserialize_u64()?;
+                values.try_reserve(1).map_err(|_| DecodeError::AllocationFailed(len))?;
+                values.push(value);
+            } else {
+                // Reserve only for words present, never for an untrusted count.
+                values.try_reserve(n).map_err(|_| DecodeError::AllocationFailed(len))?;
+                values.extend(words[..n].iter().copied().map(u64::from_le_bytes));
+                self.reader.consume(n * size_of::<u64>());
+            }
+        }
+        Ok(values)
     }
     fn deserialize_f32(self) -> Result<f32, DecodeError> {
         self.deserialize_u32().map(f32::from_bits)

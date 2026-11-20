@@ -25,8 +25,16 @@ pub fn to_writer<W: BufWriter, T: Serialize + ?Sized>(w: &mut W, value: &T) -> R
 }
 
 /// Serialize `value` into a `Vec<u8>` in the BSATN format.
+#[inline]
 pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, EncodeError> {
+    if let Some(bytes) = value.__bsatn_vec() {
+        return Ok(bytes);
+    }
     let mut v = Vec::new();
+    if let Some(size) = value.bsatn_size_hint() {
+        // A hint from a custom Serialize impl is advisory, including on allocation failure.
+        let _ = v.try_reserve_exact(size);
+    }
     to_writer(&mut v, value)?;
     Ok(v)
 }
@@ -39,11 +47,13 @@ pub fn to_len<T: Serialize + ?Sized>(value: &T) -> Result<usize, EncodeError> {
 }
 
 /// Deserialize a `T` from the BSATN format in the buffered `reader`.
+#[inline(always)]
 pub fn from_reader<'de, T: Deserialize<'de>>(reader: &mut impl BufReader<'de>) -> Result<T, DecodeError> {
-    T::deserialize(Deserializer::new(reader))
+    T::deserialize_from_bsatn(Deserializer::new(reader))
 }
 
 /// Deserialize a `T` from the BSATN format in `bytes`.
+#[inline(always)]
 pub fn from_slice<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, DecodeError> {
     from_reader(&mut &*bytes)
 }
@@ -204,7 +214,8 @@ mod private_is_primitive_type {
     pub trait Sealed {}
 }
 /// A primitive type.
-/// This is purely intended for use in `crates/bindings-macro`.
+/// Sealed to built-in fixed-width numbers whose native representation on
+/// little-endian targets matches BSATN.
 ///
 /// # Safety
 ///
@@ -225,6 +236,28 @@ is_primitive_type!(u8, i8, u16, i16, u32, i32, u64, i64, u128, i128, f32, f64);
 /// Enforces that a type is a primitive.
 /// This is purely intended for use in `crates/bindings-macro`.
 pub const fn assert_is_primitive_type<T: IsPrimitiveType>() {}
+
+/// Compute a product's fixed wire width, if all fields have one.
+#[doc(hidden)]
+pub const fn product_width(widths: &[Option<usize>]) -> Option<usize> {
+    let mut total = 0usize;
+    let mut i = 0;
+    while i < widths.len() {
+        let Some(width) = widths[i] else { return None };
+        let Some(next) = total.checked_add(width) else {
+            return None;
+        };
+        total = next;
+        i += 1;
+    }
+    Some(total)
+}
+
+/// Native bytes for the checked `bsatn_pod` derive path. The caller checks BSATN field order and endianness.
+#[doc(hidden)]
+pub fn pod_bytes<T: bytemuck::Pod>(items: &[T]) -> &[u8] {
+    bytemuck::cast_slice(items)
+}
 
 #[cfg(test)]
 mod tests {

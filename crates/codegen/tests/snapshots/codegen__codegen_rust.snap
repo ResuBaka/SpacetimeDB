@@ -1404,7 +1404,14 @@ Ok(index) => self.tables[index].append(update),
 Err(index) => self.tables.insert(index, update),
 }
 }
-}
+fn initial_table_slot(&mut self, empty: __DbTableUpdate) -> &mut __DbTableUpdate {
+            let index = match self.tables.binary_search_by_key(&empty.order(), __DbTableUpdate::order) {
+                Ok(index) => index,
+                Err(index) => { self.tables.insert(index, empty); index }
+            };
+            &mut self.tables[index]
+        }
+        }
 
 
 impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
@@ -1497,12 +1504,30 @@ fn parse_initial_rows(raw: __ws::v2::QueryRows) -> __sdk::Result<Self> {
                 let mut db_update = DbUpdate::with_table_capacity(raw.tables.len());
 for table_rows in raw.tables {
             match &table_rows.table[..] {
-                                "logged_out_player" => db_update.append(__DbTableUpdate::logged_out_player(__sdk::parse_row_list_as_inserts(table_rows.rows)?)),
-                "my_player" => db_update.append(__DbTableUpdate::my_player(__sdk::parse_row_list_as_inserts(table_rows.rows)?)),
-                "person" => db_update.append(__DbTableUpdate::person(__sdk::parse_row_list_as_inserts(table_rows.rows)?)),
-                "player" => db_update.append(__DbTableUpdate::player(__sdk::parse_row_list_as_inserts(table_rows.rows)?)),
-                "test_d" => db_update.append(__DbTableUpdate::test_d(__sdk::parse_row_list_as_inserts(table_rows.rows)?)),
-                "test_f" => db_update.append(__DbTableUpdate::test_f(__sdk::parse_row_list_as_inserts(table_rows.rows)?)),
+                                "logged_out_player" => {
+                let __DbTableUpdate::logged_out_player(update) = db_update.initial_table_slot(__DbTableUpdate::logged_out_player(Default::default())) else { unreachable!() };
+                update.append_initial_rows(table_rows.rows)?;
+                },
+                "my_player" => {
+                let __DbTableUpdate::my_player(update) = db_update.initial_table_slot(__DbTableUpdate::my_player(Default::default())) else { unreachable!() };
+                update.append_initial_rows(table_rows.rows)?;
+                },
+                "person" => {
+                let __DbTableUpdate::person(update) = db_update.initial_table_slot(__DbTableUpdate::person(Default::default())) else { unreachable!() };
+                update.append_initial_rows(table_rows.rows)?;
+                },
+                "player" => {
+                let __DbTableUpdate::player(update) = db_update.initial_table_slot(__DbTableUpdate::player(Default::default())) else { unreachable!() };
+                update.append_initial_rows(table_rows.rows)?;
+                },
+                "test_d" => {
+                let __DbTableUpdate::test_d(update) = db_update.initial_table_slot(__DbTableUpdate::test_d(Default::default())) else { unreachable!() };
+                update.append_initial_rows(table_rows.rows)?;
+                },
+                "test_f" => {
+                let __DbTableUpdate::test_f(update) = db_update.initial_table_slot(__DbTableUpdate::test_f(Default::default())) else { unreachable!() };
+                update.append_initial_rows(table_rows.rows)?;
+                },
                 unknown => { return Err(__sdk::InternalError::unknown_name("table", unknown, "QueryRows").into()); }
 }}        Ok(db_update)
 }

@@ -325,6 +325,18 @@ impl<Row> TableUpdate<Row> {
 }
 
 impl<Row: DeserializeOwned + Debug> TableUpdate<Row> {
+    /// Decode one initial query result into this table's accumulated inserts.
+    /// Even an empty list means the table is present in the snapshot.
+    pub fn append_initial_rows(&mut self, rows: BsatnRowList) -> crate::Result<()> {
+        let start = self.inserts.len();
+        if let Err(err) = Self::parse_from_row_list(&mut self.inserts, &rows) {
+            self.inserts.truncate(start);
+            return Err(err);
+        }
+        self.present = true;
+        Ok(())
+    }
+
     /// Parse `raw_updates` into a [`TableUpdate`].
     pub fn parse_table_update(raw_updates: ws::v2::TableUpdate) -> crate::Result<TableUpdate<Row>> {
         let mut inserts = Vec::new();
@@ -380,14 +392,9 @@ pub fn parse_row_list_as_inserts<Row>(rows: BsatnRowList) -> crate::Result<Table
 where
     Row: DeserializeOwned + Debug,
 {
-    let mut inserts = Vec::new();
-    TableUpdate::parse_from_row_list(&mut inserts, &rows)?;
-    Ok(TableUpdate {
-        inserts,
-        deletes: Vec::new(),
-        present: true,
-        initial: false,
-    })
+    let mut update = TableUpdate::default();
+    update.append_initial_rows(rows)?;
+    Ok(update)
 }
 
 pub fn parse_row_list_as_deletes<Row>(rows: BsatnRowList) -> crate::Result<TableUpdate<Row>>
@@ -426,6 +433,20 @@ mod table_update_append_tests {
 
     fn values(rows: &[WithBsatn<u32>]) -> Vec<u32> {
         rows.iter().map(|row| row.row).collect()
+    }
+
+    #[test]
+    fn failed_initial_list_does_not_leave_partial_rows() {
+        let mut update = parse_row_list_as_inserts::<u32>(raw_rows(&[10])).unwrap();
+        // The first row decodes; the second has only one of its four bytes.
+        let malformed = || BsatnRowList::new(RowSizeHint::RowOffsets([0, 4].into()), vec![20, 0, 0, 0, 1].into());
+        assert!(update.append_initial_rows(malformed()).is_err());
+        assert_eq!(values(&update.inserts), [10]);
+
+        let mut absent = TableUpdate::<u32>::default();
+        assert!(absent.append_initial_rows(malformed()).is_err());
+        absent.mark_initial();
+        assert!(!absent.has_changes());
     }
 
     #[test]

@@ -1513,7 +1513,21 @@ fn print_db_update_defn(module: &ModuleDef, visibility: CodegenVisibility, out: 
     );
     let table_count = iter_table_names_and_types(module, visibility).count();
     writeln!(out, "fn with_table_capacity(hint: usize) -> Self {{ Self {{ tables: Vec::with_capacity(hint.min({table_count})) }} }}\nfn append(&mut self, update: __DbTableUpdate) {{");
-    writeln!(out, "match self.tables.binary_search_by_key(&update.order(), __DbTableUpdate::order) {{\nOk(index) => self.tables[index].append(update),\nErr(index) => self.tables.insert(index, update),\n}}\n}}\n}}");
+    writeln!(out, "match self.tables.binary_search_by_key(&update.order(), __DbTableUpdate::order) {{\nOk(index) => self.tables[index].append(update),\nErr(index) => self.tables.insert(index, update),\n}}\n}}");
+
+    // Initial query results can name the same table more than once. Keep a
+    // single destination in the usual apply order while decoding in wire order.
+    writeln!(
+        out,
+        "fn initial_table_slot(&mut self, empty: __DbTableUpdate) -> &mut __DbTableUpdate {{
+            let index = match self.tables.binary_search_by_key(&empty.order(), __DbTableUpdate::order) {{
+                Ok(index) => index,
+                Err(index) => {{ self.tables.insert(index, empty); index }}
+            }};
+            &mut self.tables[index]
+        }}
+        }}"
+    );
 
     out.newline();
 
@@ -1662,11 +1676,11 @@ impl __sdk::InModule for DbUpdate {{
                                 "match &table_rows.table[..] {",
                                 |out| {
                                     for (name, accessor_name, _) in iter_table_names_and_types(module, visibility) {
+                                        let field = table_method_name(accessor_name);
                                         writeln!(
                                             out,
-                                            "{:?} => db_update.append(__DbTableUpdate::{}(__sdk::parse_row_list_as_inserts(table_rows.rows)?)),",
+                                            "{:?} => {{\nlet __DbTableUpdate::{field}(update) = db_update.initial_table_slot(__DbTableUpdate::{field}(Default::default())) else {{ unreachable!() }};\nupdate.append_initial_rows(table_rows.rows)?;\n}},",
                                             name.deref(),
-                                            table_method_name(accessor_name),
                                         );
                                     }
                                     writeln!(

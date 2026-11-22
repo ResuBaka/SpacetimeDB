@@ -52,6 +52,8 @@ mod sparse_dispatch_tests {
             tables: vec![
                 table("person", rows(2)),
                 table("logged_out_player", Default::default()),
+                table("person", Default::default()),
+                table("person", rows(2)),
                 table("person", rows(1)),
             ]
             .into(),
@@ -61,7 +63,7 @@ mod sparse_dispatch_tests {
         assert!(update.tables.windows(2).all(|pair| pair[0].order() < pair[1].order()));
         match &update.tables[1] {
             __DbTableUpdate::person(person) => {
-                assert_eq!(person.inserts.iter().map(|r| r.row.id).collect::<Vec<_>>(), [2, 1]);
+                assert_eq!(person.inserts.iter().map(|r| r.row.id).collect::<Vec<_>>(), [2, 2, 1]);
                 assert!(person.deletes.is_empty());
             }
             _ => panic!("expected person table after logged_out_player"),
@@ -74,6 +76,15 @@ mod sparse_dispatch_tests {
             }
             _ => panic!("missing empty initial table"),
         }
+    }
+
+    #[test]
+    fn malformed_later_list_rejects_the_entire_snapshot() {
+        let malformed = __ws::common::BsatnRowList::new(__ws::common::RowSizeHint::FixedSize(1), vec![0].into());
+        assert!(DbUpdate::parse_initial_rows(__ws::v2::QueryRows {
+            tables: vec![table("person", rows(1)), table("person", malformed)].into(),
+        })
+        .is_err());
     }
 
     #[test]

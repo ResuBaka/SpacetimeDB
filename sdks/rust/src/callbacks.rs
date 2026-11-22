@@ -225,7 +225,7 @@ mod initial_callback_tests {
     fn rows(clones: &Arc<AtomicUsize>) -> Vec<WithBsatn<Row>> {
         (0..5)
             .map(|index| WithBsatn {
-                bsatn: Bytes::new(),
+                bsatn: Default::default(),
                 row: Row {
                     value: format!("row-{index}"),
                     clones: Arc::clone(clones),

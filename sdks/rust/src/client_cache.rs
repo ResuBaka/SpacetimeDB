@@ -342,7 +342,7 @@ mod applied_diff_tests {
 
     fn row(id: u32, value: u32) -> WithBsatn<PkRow> {
         WithBsatn {
-            bsatn: Bytes::new(),
+            bsatn: Default::default(),
             row: PkRow { id, value },
         }
     }
@@ -1354,7 +1354,7 @@ mod tests {
 
     fn row(value: u8) -> WithBsatn<u8> {
         WithBsatn {
-            bsatn: Bytes::from(vec![value]),
+            bsatn: Default::default(),
             row: value,
         }
     }
@@ -1380,7 +1380,7 @@ mod tests {
 
     fn pk_row(id: u8, value: u8) -> WithBsatn<PkRow> {
         WithBsatn {
-            bsatn: Bytes::from(vec![id, value]),
+            bsatn: Default::default(),
             row: PkRow { id, value },
         }
     }

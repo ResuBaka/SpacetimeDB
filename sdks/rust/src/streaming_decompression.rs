@@ -101,9 +101,18 @@ impl<R: Read> Decoder<'_, R> {
         while bytes.len() < len {
             let start = bytes.len();
             let count = (len - start).min(64 * 1024);
-            bytes
-                .try_reserve(count)
-                .map_err(|_| DecodeError::AllocationFailed(len))?;
+            // Bound the final growth: when doubling the existing capacity would
+            // overshoot the declared remaining length, reserve exactly up to
+            // `len` instead of geometric growth past it.
+            if bytes.capacity() > len / 2 {
+                bytes
+                    .try_reserve_exact(len - start)
+                    .map_err(|_| DecodeError::AllocationFailed(len))?;
+            } else {
+                bytes
+                    .try_reserve(count)
+                    .map_err(|_| DecodeError::AllocationFailed(len))?;
+            }
             bytes.resize(start + count, 0);
             self.exact(&mut bytes[start..])?;
         }

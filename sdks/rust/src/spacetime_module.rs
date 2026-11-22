@@ -10,6 +10,7 @@ use crate::{
     Event, ReducerEvent,
     __codegen::InternalError,
 };
+#[cfg(any(feature = "client-cache", feature = "retain-row-bytes", test))]
 use bytes::Bytes;
 use spacetimedb_client_api_messages::websocket::{self as ws, common::RowListLen as _, v2::BsatnRowList};
 use spacetimedb_lib::{bsatn, de::DeserializeOwned};
@@ -244,10 +245,19 @@ where
 #[derive(Debug)]
 pub struct WithBsatn<Row> {
     /// Serialized row bytes, retained with `client-cache` or `retain-row-bytes`.
-    /// Empty in the default cacheless parsing path; `row` is fully owned.
-    pub bsatn: Bytes,
+    /// Zero-sized in the default cacheless parsing path; `row` is fully owned.
+    pub bsatn: BsatnBytes,
     pub row: Row,
 }
+
+/// Storage behind [`WithBsatn::bsatn`]:
+/// serialized row bytes when the consumer retains them
+/// (`client-cache` or `retain-row-bytes`),
+/// or a zero-sized `[u8; 0]` in the default cacheless parsing path.
+#[cfg(any(feature = "client-cache", feature = "retain-row-bytes"))]
+pub type BsatnBytes = Bytes;
+#[cfg(not(any(feature = "client-cache", feature = "retain-row-bytes")))]
+pub type BsatnBytes = [u8; 0];
 
 #[derive(Debug)]
 pub struct TableUpdate<Row> {
@@ -349,7 +359,9 @@ impl<Row: DeserializeOwned + Debug> TableUpdate<Row> {
         for bytes in raw_rows.iter_slices() {
             sink.push(WithBsatn {
                 row: Self::decode_row(bytes)?,
-                bsatn: Bytes::new(),
+                // The cacheless path always drops the wire bytes after
+                // decoding, so the row storage is zero-sized there.
+                bsatn: [],
             });
         }
         Ok(())
@@ -503,11 +515,11 @@ mod table_update_append_tests {
         for _ in 0..2 {
             let mut update = TableUpdate::default();
             update.inserts.push(WithBsatn {
-                bsatn: Bytes::new(),
+                bsatn: Default::default(),
                 row: Row(Arc::clone(&drops)),
             });
             update.deletes.push(WithBsatn {
-                bsatn: Bytes::new(),
+                bsatn: Default::default(),
                 row: Row(Arc::clone(&drops)),
             });
             combined.append(update);

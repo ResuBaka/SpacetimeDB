@@ -183,12 +183,12 @@ impl<M: SpacetimeModule> SubscriptionBuilder<M> {
         let handle = SubscriptionHandleImpl::new(SubscriptionState::new(
             query_set_id,
             query_sql.into_queries(),
-            self.conn.pending_mutations_send.clone(),
+            self.conn.pending_mutations_send().clone(),
             self.on_applied,
             self.on_error,
         ));
         self.conn
-            .pending_mutations_send
+            .pending_mutations_send()
             .unbounded_send(PendingMutation::Subscribe {
                 query_set_id,
                 handle: handle.clone(),

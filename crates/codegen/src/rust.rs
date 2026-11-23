@@ -1784,9 +1784,8 @@ impl __sdk::InModule for AppliedDiff<'_> {{
                     for (name, accessor_name, product_type_ref) in iter_table_names_and_types(module, visibility) {
                         writeln!(
                             out,
-                            "__AppliedTableDiff::{}(diff) => {{ if diff.has_changes() && callbacks.has_callbacks({:?}) {{ callbacks.invoke_table_row_callbacks::<{}>({:?}, diff, event); }} }},",
+                            "__AppliedTableDiff::{}(diff) => callbacks.invoke_table_row_callbacks::<{}>({:?}, diff, event),",
                             table_method_name(accessor_name),
-                            name.deref(),
                             type_ref_name(module, product_type_ref),
                             name.deref(),
                         );

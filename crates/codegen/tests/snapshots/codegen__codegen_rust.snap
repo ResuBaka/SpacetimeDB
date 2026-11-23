@@ -1582,12 +1582,12 @@ impl __sdk::InModule for AppliedDiff<'_> {
 impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
     fn invoke_row_callbacks(&self, event: &EventContext, callbacks: &mut __sdk::DbCallbacks<RemoteModule>) {
                 for table in &self.tables { match table {
-        __AppliedTableDiff::logged_out_player(diff) => { if diff.has_changes() && callbacks.has_callbacks("logged_out_player") { callbacks.invoke_table_row_callbacks::<Player>("logged_out_player", diff, event); } },
-        __AppliedTableDiff::my_player(diff) => { if diff.has_changes() && callbacks.has_callbacks("my_player") { callbacks.invoke_table_row_callbacks::<Player>("my_player", diff, event); } },
-        __AppliedTableDiff::person(diff) => { if diff.has_changes() && callbacks.has_callbacks("person") { callbacks.invoke_table_row_callbacks::<Person>("person", diff, event); } },
-        __AppliedTableDiff::player(diff) => { if diff.has_changes() && callbacks.has_callbacks("player") { callbacks.invoke_table_row_callbacks::<Player>("player", diff, event); } },
-        __AppliedTableDiff::test_d(diff) => { if diff.has_changes() && callbacks.has_callbacks("test_d") { callbacks.invoke_table_row_callbacks::<TestD>("test_d", diff, event); } },
-        __AppliedTableDiff::test_f(diff) => { if diff.has_changes() && callbacks.has_callbacks("test_f") { callbacks.invoke_table_row_callbacks::<TestFoobar>("test_f", diff, event); } },
+        __AppliedTableDiff::logged_out_player(diff) => callbacks.invoke_table_row_callbacks::<Player>("logged_out_player", diff, event),
+        __AppliedTableDiff::my_player(diff) => callbacks.invoke_table_row_callbacks::<Player>("my_player", diff, event),
+        __AppliedTableDiff::person(diff) => callbacks.invoke_table_row_callbacks::<Person>("person", diff, event),
+        __AppliedTableDiff::player(diff) => callbacks.invoke_table_row_callbacks::<Player>("player", diff, event),
+        __AppliedTableDiff::test_d(diff) => callbacks.invoke_table_row_callbacks::<TestD>("test_d", diff, event),
+        __AppliedTableDiff::test_f(diff) => callbacks.invoke_table_row_callbacks::<TestFoobar>("test_f", diff, event),
         __AppliedTableDiff::__Unused(_) => unreachable!(),
         } }
 }

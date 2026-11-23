@@ -68,11 +68,10 @@ fn rust_dispatch_guards_untouched_tables_before_cache_or_callback_lookup() {
     assert!(code.contains("self.tables.binary_search_by_key(&update.order(), __DbTableUpdate::order)"));
     let callbacks = code.split("fn invoke_row_callbacks").nth(1).unwrap();
     assert!(callbacks.contains("for table in &self.tables"));
-    let lookup = regex::Regex::new(r"if diff\.has_changes\(\) && callbacks\.has_callbacks\(").unwrap();
-    assert!(lookup.is_match(callbacks));
-    assert_eq!(
-        callbacks.matches("callbacks.has_callbacks(").count(),
-        lookup.captures_iter(callbacks).count()
+    assert!(callbacks.contains("callbacks.invoke_table_row_callbacks"));
+    assert!(
+        !callbacks.contains("callbacks.has_callbacks("),
+        "dispatch performs the lookup in the SDK"
     );
 }
 

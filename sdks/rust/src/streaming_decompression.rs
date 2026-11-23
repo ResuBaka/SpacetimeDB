@@ -20,9 +20,42 @@ pub(crate) fn decode(raw: &[u8]) -> Result<ServerMessage, WsError> {
         [SERVER_MSG_COMPRESSION_TAG_BROTLI, bytes @ ..] => {
             decode_reader(brotli::Decompressor::new(bytes, 4096), "brotli")
         }
-        [SERVER_MSG_COMPRESSION_TAG_GZIP, bytes @ ..] => decode_reader(flate2::read::GzDecoder::new(bytes), "gzip"),
+        [SERVER_MSG_COMPRESSION_TAG_GZIP, bytes @ ..] => {
+            let gzip = flate2::bufread::GzDecoder::new(bytes);
+            if raw.len() <= 4096 {
+                decode_small_gzip(gzip)
+            } else {
+                decode_reader(gzip, "gzip")
+            }
+        }
         [scheme, ..] => Err(WsError::UnknownCompressionScheme { scheme: *scheme }),
     }
+}
+
+// Small transactions usually fit in one slice. Never size this buffer from
+// the wire, and never return a decoded message before checking the trailer.
+fn decode_small_gzip(mut gzip: impl Read) -> Result<ServerMessage, WsError> {
+    let mut scratch = [0; 8192];
+    let mut n = 0;
+    while n < scratch.len() {
+        match gzip.read(&mut scratch[n..]) {
+            Ok(0) => {
+                return spacetimedb_sats::bsatn::from_slice(&scratch[..n])
+                    .map_err(|source| WsError::DeserializeMessage { source })
+            }
+            Ok(count) => n += count,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(WsError::Decompress {
+                    scheme: "gzip",
+                    source: Arc::new(e),
+                })
+            }
+        }
+    }
+    // A small compressed input may expand into a large snapshot. Feed the
+    // prefix to the ordinary streaming decoder and continue the same member.
+    decode_reader(scratch.as_slice().chain(gzip), "gzip")
 }
 
 pub(crate) fn decode_reader(reader: impl Read, scheme: &'static str) -> Result<ServerMessage, WsError> {

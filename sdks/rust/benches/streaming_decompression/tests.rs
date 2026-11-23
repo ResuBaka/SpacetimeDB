@@ -90,6 +90,30 @@ fn truncated_and_malformed_frames() {
 }
 
 #[test]
+fn small_gzip_crosses_scratch_boundary_and_still_validates_trailer() {
+    for size in [8191, 8192, 8193, 131072] {
+        let msg = ServerMessage::SubscriptionError(SubscriptionError {
+            request_id: None,
+            query_set_id: QuerySetId::new(3),
+            error: "".into(),
+        });
+        let overhead = bsatn::to_vec(&msg).unwrap().len();
+        let ServerMessage::SubscriptionError(mut error) = msg else {
+            unreachable!()
+        };
+        error.error = "x".repeat(size - overhead).into();
+        let raw = bsatn::to_vec(&ServerMessage::SubscriptionError(error)).unwrap();
+        assert_eq!(raw.len(), size);
+        let mut wire = fixture::compress(&raw, SERVER_MSG_COMPRESSION_TAG_GZIP);
+        assert!(wire.len() <= 4096);
+        assert_eq!(bsatn::to_vec(&streaming(&wire).unwrap()).unwrap(), raw);
+        let crc = wire.len() - 8;
+        wire[crc] ^= 1;
+        assert!(streaming(&wire).unwrap_err().contains("decompress"));
+    }
+}
+
+#[test]
 fn trailing_bytes_and_members_match_baseline() {
     let mut bytes = bsatn::to_vec(&fixture::message(256, false)).unwrap();
     bytes.extend_from_slice(&[42; 100_000]);

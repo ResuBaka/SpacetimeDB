@@ -16,6 +16,8 @@ client-cache = ["dep:anymap3"]
 retain-row-bytes = []
 # Experimental owned decoder; intentionally not enabled by default.
 streaming-decompression = []
+# Try bundled libdeflate for small native gzip frames; other targets keep the Rust decoder.
+native-small-gzip = ["streaming-decompression", "dep:libdeflater"]
 # Opt into Rustls for native WSS; otherwise use buffered native TLS.
 tokio-websockets-rustls = ["dep:tokio-rustls", "dep:rustls-platform-verifier", "tokio-websockets/rustls-bring-your-own-connector"]
 allow_loopback_http_for_tests = ["spacetimedb-testing/allow_loopback_http_for_tests"]
@@ -65,6 +67,7 @@ wasm-bindgen-futures = { version = "0.4.45", optional = true }
 web-sys = { version = "0.3.77", features = ["HtmlDocument"], optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libdeflater = { version = "1.26.1", optional = true }
 home.workspace = true
 native-tls = "0.2"
 rustls-platform-verifier = { version = "0.7", optional = true }

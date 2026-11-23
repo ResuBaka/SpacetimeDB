@@ -626,6 +626,8 @@ impl WsConnection {
         let mut idle = true;
         let mut want_pong = false;
 
+        #[cfg(all(feature = "native-small-gzip", not(target_arch = "wasm32")))]
+        let mut small_gzip = crate::native_small_gzip::SmallGzip::default();
         let mut outgoing_messages = Some(outgoing_messages);
         loop {
             tokio::select! {
@@ -648,7 +650,11 @@ impl WsConnection {
                         let bytes = message.into_payload();
                         idle = false;
                         record_metrics(bytes.len());
-                        match Self::parse_response(&bytes) {
+                        #[cfg(all(feature = "native-small-gzip", not(target_arch = "wasm32")))]
+                        let parsed = small_gzip.try_decode(&bytes).unwrap_or_else(|| Self::parse_response(&bytes));
+                        #[cfg(not(all(feature = "native-small-gzip", not(target_arch = "wasm32"))))]
+                        let parsed = Self::parse_response(&bytes);
+                        match parsed {
                             Err(e) => maybe_log_error!(
                                 &extra_logging,
                                 "Error decoding WebSocketMessage::Binary payload",

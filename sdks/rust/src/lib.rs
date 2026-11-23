@@ -15,6 +15,8 @@ mod client_cache;
 mod compression;
 mod db_connection;
 mod metrics;
+#[cfg(all(feature = "native-small-gzip", not(feature = "browser"), not(target_arch = "wasm32")))]
+mod native_small_gzip;
 #[cfg(not(feature = "browser"))]
 mod payload_capture;
 mod spacetime_module;

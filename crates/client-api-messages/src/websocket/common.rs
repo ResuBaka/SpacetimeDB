@@ -142,6 +142,18 @@ impl ByteListLen for BsatnRowList {
 }
 
 impl BsatnRowList {
+    /// Borrow the complete payload when it encodes exactly one row starting
+    /// at offset zero. Noncanonical layouts fall back to normal iteration.
+    #[inline]
+    pub fn single_row_slice(&self) -> Option<&[u8]> {
+        match &self.size_hint {
+            RowSizeHint::FixedSize(size) if *size != 0 && usize::from(*size) == self.rows_data.len() => {}
+            RowSizeHint::RowOffsets(offsets) if offsets.as_ref() == [0] => {}
+            _ => return None,
+        }
+        Some(&self.rows_data)
+    }
+
     /// Returns the element at `index` in the list.
     pub fn get(&self, index: usize) -> Option<Bytes> {
         let data_end = self.rows_data.len();

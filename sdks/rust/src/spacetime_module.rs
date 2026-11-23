@@ -361,6 +361,16 @@ impl<Row: DeserializeOwned + Debug> TableUpdate<Row> {
     }
 
     fn parse_from_row_list(sink: &mut Vec<WithBsatn<Row>>, raw_rows: &ws::common::BsatnRowList) -> crate::Result<()> {
+        #[cfg(not(any(feature = "client-cache", feature = "retain-row-bytes")))]
+        if sink.capacity() == 0 {
+            if let Some(bytes) = raw_rows.single_row_slice() {
+                *sink = vec![WithBsatn {
+                    row: Self::decode_row(bytes)?,
+                    bsatn: [],
+                }];
+                return Ok(());
+            }
+        }
         sink.reserve(raw_rows.len());
         #[cfg(any(feature = "client-cache", feature = "retain-row-bytes"))]
         for bsatn in raw_rows {
@@ -644,6 +654,26 @@ mod row_byte_retention_tests {
             }
         }
         assert_eq!(parsed.inserts.len(), expected.len());
+    }
+
+    #[test]
+    fn singleton_offsets_respect_the_row_span_even_when_it_is_empty() {
+        let rows = BsatnRowList::new(
+            RowSizeHint::RowOffsets([1].into()),
+            Bytes::from_static(&[0xff, 7, 0, 0, 0]),
+        );
+        let parsed = parse_row_list_as_inserts::<u32>(rows).unwrap();
+        assert_eq!(parsed.inserts.len(), 1);
+        assert_eq!(parsed.inserts[0].row, 7);
+
+        // The offset count, not the payload length, distinguishes a unit row
+        // from an empty table update.
+        let unit = BsatnRowList::new(RowSizeHint::RowOffsets([0].into()), Bytes::new());
+        assert_eq!(parse_row_list_as_inserts::<()>(unit).unwrap().inserts.len(), 1);
+        assert!(parse_row_list_as_inserts::<()>(BsatnRowList::default())
+            .unwrap()
+            .inserts
+            .is_empty());
     }
 
     #[test]
